@@ -1,0 +1,13 @@
+[Unit]
+Description=Radar Lab -- standalone NEXRAD radar/severe-weather viewer
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/docker/radar-lab
+ExecStart=%h/docker/radar-lab/.venv/bin/python %h/docker/radar-lab/bin/radar_lab.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

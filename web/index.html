@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radar Lab</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f14; font-family: system-ui, sans-serif; }
+  #grid {
+    /* position:fixed (not absolute) so this is anchored straight to the
+       viewport, independent of html/body's own computed height -- mobile
+       Safari's dynamic toolbar makes height:100% on body unreliable right
+       at page load, which is a classic cause of Leaflet map containers
+       measuring zero size (tiles never appear, but everything else on
+       the page looks fine, since only Leaflet needs real pixel
+       dimensions to know what to fetch/render). */
+    position: fixed; inset: 0; display: grid; gap: 2px; background: #000;
+  }
+  #grid.layout-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  #grid.layout-2 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+  #grid.layout-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .panel { position: relative; overflow: hidden; }
+  .panel-map { position: absolute; inset: 0; }
+  .leaflet-div-icon.site-pill-wrap { background: transparent; border: none; }
+  .site-pill {
+    display: inline-block; background: rgba(10, 14, 20, .85); color: #cbd5e1;
+    border: 1px solid #3a3a3a; border-radius: 10px; padding: 1px 6px;
+    font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer;
+    transform: translate(-50%, -50%); /* center the pill on the site's coordinate */
+  }
+  .site-pill:hover { background: rgba(30, 41, 59, .95); }
+  .site-pill.site-pill-active { background: #38bdf8; color: #0b0f14; border-color: #38bdf8; }
+  .panel-toolbar {
+    position: absolute; top: 4px; left: 4px; z-index: 1000;
+    background: rgba(10, 14, 20, .85); border-radius: 4px; padding: 2px 4px;
+    display: flex; flex-direction: column; gap: 2px; max-width: 45%;
+  }
+  .panel-toolbar select { font-size: 12px; max-width: 100%; }
+  #hud-toggle {
+    position: fixed; top: 8px; right: 8px; z-index: 1100;
+    width: 38px; height: 38px; border: none; border-radius: 8px;
+    background: rgba(10, 14, 20, .9); color: #e8e8e8; font-size: 18px;
+    line-height: 1; cursor: pointer;
+  }
+  #hud {
+    position: fixed; top: 8px; right: 8px; z-index: 1000;
+    background: rgba(10, 14, 20, .92); color: #cbd5e1; padding: 8px 10px;
+    padding-top: 50px; /* clears the toggle button, which sits on top of it */
+    border-radius: 6px; font-size: 13px; max-width: 260px;
+    max-height: calc(100% - 16px); overflow-y: auto;
+    transition: transform .2s ease;
+  }
+  #hud.hud-collapsed { transform: translateX(calc(100% + 16px)); }
+  #hud label { display: block; margin-top: 6px; }
+  #hud select, #hud button, #hud input[type=range] { width: 100%; }
+  #hud .row { display: flex; gap: 6px; align-items: center; }
+  #hud .row label { display: flex; gap: 4px; align-items: center; flex: 1; margin-top: 0; }
+  #status { margin-top: 6px; opacity: .7; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="grid" class="layout-1"></div>
+<button id="hud-toggle" aria-label="Toggle menu">&#9776;</button>
+<div id="hud">
+  <strong>Radar Lab</strong> <span id="site"></span>
+  <label>Radar site
+    <select id="site-select"><option value="">loading...</option></select>
+  </label>
+  <label>Layout
+    <select id="layout">
+      <option value="1">Single view</option>
+      <option value="2">Split (2)</option>
+      <option value="4">Grid (4)</option>
+    </select>
+  </label>
+  <label class="row"><input type="checkbox" id="toggle-sync"> Sync pan/zoom across panels</label>
+  <label>Base map
+    <select id="base-layer">
+      <option value="streets">Streets</option>
+      <option value="dark">Dark</option>
+      <option value="satellite">Satellite</option>
+    </select>
+  </label>
+  <label>GOES cloud imagery
+    <select id="goes-layer">
+      <option value="off">Off</option>
+      <option value="ir">IR (day/night)</option>
+      <option value="visible">Visible (day only)</option>
+      <option value="geocolor">GeoColor</option>
+    </select>
+  </label>
+  <label>Playback <span id="ts-label"></span>
+    <input type="range" id="scan-slider" min="0" max="0" value="0">
+  </label>
+  <div class="row">
+    <button id="play">Play</button>
+    <button id="live">Live</button>
+  </div>
+  <label class="row"><input type="checkbox" id="toggle-cameras" checked> DOT cameras</label>
+  <label class="row"><input type="checkbox" id="toggle-alerts" checked> NWS alerts</label>
+  <label class="row"><input type="checkbox" id="toggle-gps" checked> GPS position</label>
+  <label class="row"><input type="checkbox" id="toggle-nst" checked> Storm tracks (NST)</label>
+  <label class="row"><input type="checkbox" id="toggle-nmd" checked> Mesocyclone (NMD)</label>
+  <label class="row"><input type="checkbox" id="toggle-site-pills" checked> Radar site pills</label>
+  <div id="status">loading...</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
