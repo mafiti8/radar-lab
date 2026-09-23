@@ -1,33 +1,53 @@
 # Radar Lab
 
-V1 scaffold. Full design doc (data sources, architecture decisions, open
-questions, reasoning) lives at `~/docs/projects/radar-lab/README.md` --
-read that first, this file is just how to run what's here.
+A free, self-hosted NEXRAD weather radar viewer — the core value of apps
+like RadarScope or RadarOmega, built entirely on public NOAA/NWS data, with
+no subscription and no account.
 
-**Real deployment target is a dedicated field laptop, not this box** --
-that hasn't changed. But as of 2026-09-23 there's also a permanent copy
-running here on homehub as a `systemd --user` service (see
-`~/.config/systemd/user/radar-lab.service`, installed from
-`radar-lab.service.template`), on the portal page, purely so it's easy
-to check from a phone/browser during development -- this is a
-convenience copy, not the real deployment. Copy the whole project
-directory to the field laptop when it's ready and install the same
-service template there.
+- **Live radar**: reflectivity, velocity, and dual-pol (ZDR/CC/PhiDP),
+  with per-panel tilt selection across all of a site's real elevation
+  angles — not just the lowest scan.
+- **Split-screen**: view 1, 2, or 4 panels at once, each with its own
+  product and pan/zoom — e.g. reflectivity next to velocity for the same
+  storm, or two different storm sections side by side.
+- **Any radar site, nationwide**: switch between all 159 real WSR-88D
+  stations from a dropdown, or click a labeled pin at the station's
+  actual location on the map.
+- **Severe weather overlays**: live NWS storm-track and mesocyclone
+  detection, plus active NWS alert polygons.
+- **DOT traffic cameras**: live public traffic camera feeds (Indiana,
+  Illinois, Kentucky, Wisconsin), clustered so multiple cameras at one
+  interchange don't hide behind each other.
+- **GOES satellite overlay**: infrared, visible, and GeoColor cloud
+  imagery from NASA GIBS.
+- **Streets, dark, or satellite basemap**, playback of recent scans, and
+  (on hardware with a receiver) live GPS position overlay.
 
-- **Access: tailnet HTTPS only** -- `https://homehub.taile00f3f.ts.net:8454`
-  (`sudo tailscale serve --bg --https=8454 8297` run 2026-09-23, verified
-  working, portal link updated same day). The plain LAN address
-  (`http://192.168.0.213:8297`) does NOT work and isn't worth fixing
-  separately: this box runs a default-deny nftables firewall
-  (`/etc/nftables.conf`, `policy drop` on the input chain) where every
-  LAN-exposed port needs an explicit allowlist entry on `enp1s0`, and
-  8297 was never added (allowlist stops at 8292). That produced a silent
-  hang rather than a clean refusal (drop policy, no RST) -- confusing to
-  debug blind, worth remembering if a future port ever "just won't load"
-  on this box. Tailscale traffic bypasses that allowlist entirely
-  (`iifname "tailscale0" accept`), which is also the pattern the last
-  several tools built here (harness-designer, parts-wishlist,
-  grocery-prices) already use instead of adding new LAN rules.
+Everything renders client-side in the browser — the backend only ever
+ships plain data, never pre-rendered images — so panning and zooming
+stays responsive without a round trip to the server for every move.
+
+## System requirements
+
+- **OS**: Linux x86_64 only. The scientific dependency stack (Py-ART,
+  NumPy, SciPy via MetPy) ships as compiled `manylinux` wheels with no
+  ARM or Windows/macOS builds. Windows: use WSL2. macOS/ARM (Apple
+  Silicon, Raspberry Pi): not supported.
+- **Python**: 3.10 or newer.
+- **RAM**: under 1GB steady-state (measured: ~225MB base + ~45MB per
+  cached radar scan, ~13 scans in the default 90-minute rolling window).
+  No swap or special tuning needed.
+- **CPU**: any x86_64 CPU from roughly the last decade. Decoding a new
+  volume scan takes ~2-3s, but that only happens once every 6-7 minutes
+  (the real NEXRAD update cadence) — not a sustained load.
+- **Disk**: ~650MB for the Python virtual environment (dominated by
+  SciPy/pandas, pulled in by MetPy). No database, no permanent storage —
+  everything is an in-memory rolling cache.
+- **Network**: modest. ~9MB per radar volume scan every 6-7 minutes, plus
+  small camera/alert/satellite-tile fetches. Comfortable over a
+  cellular connection or Starlink, let alone home broadband.
+- **Browser**: any modern browser. Built and tested against desktop
+  Chrome/Firefox and iOS Safari.
 
 ## Install
 
@@ -62,6 +82,29 @@ all right now. If this gets published for wider use, that's the first
 real limitation to flag for anyone outside Linux x86_64 -- worth
 deciding then whether it's worth chasing (conda-forge has ARM/macOS
 Py-ART builds, which might be an easier path than fighting pip wheels).
+
+---
+
+## Developer / build notes
+
+Everything from here down is notes from the original build (on a home
+server called "homehub"), kept for continuity and for anyone extending
+this project -- **none of it is required to just run the software**; the
+Install section above is everything you need for that. Full design doc
+(data sources, architecture decisions, open questions, reasoning) is
+referenced throughout as `~/docs/projects/radar-lab/README.md` -- that
+path is on the original build machine, not part of this repo.
+
+**Original deployment target was a dedicated field laptop** -- a
+permanent copy also ended up running on homehub itself (the build
+machine) as a `systemd --user` service, purely for convenience during
+development (easy to check from a phone/browser without needing the
+field laptop). If you're self-hosting this from a clone of this repo,
+none of the following homehub-specific networking details apply to
+you -- your own `./install.sh` run is all you need; how *this specific
+original copy* was made reachable (Tailscale Funnel, a particular
+firewall's allowlist, etc.) is homehub's own configuration, not a
+requirement of the software itself.
 
 ## What's real vs. stubbed
 
