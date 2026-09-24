@@ -258,22 +258,60 @@ requirement of the software itself.
     view showing 4 different products). This is a real cost of the
     architecture, not a bug, but worth knowing if performance still
     feels off after the fixes above.
-- **Radar render resolution was artificially low, fixed 2026-09-23**:
-  canvas size was a flat 700px regardless of the actual data, which for
-  a ~460km-radius circle works out to ~1315m/pixel -- 5.3x coarser than
-  the data's real 250m gate spacing. That's genuine thrown-away detail
-  (graininess from the renderer, not a real limit of the radar itself),
-  which is what made it look grainy while zooming in even though the
-  positioning/sizing was correct. Canvas size is now derived from the
-  actual data dimensions (`2 * maxRange / gateStep`, ~3680px = true
-  native resolution), capped at 1800px for compute time -- measured
-  ~148ms per render at that size vs. ~24ms at the old 700px, still fine
-  for a per-scan render. A true tile-pyramid renderer (re-rendering at
-  the viewport's actual zoom/extent instead of one fixed-resolution
-  image for the whole radar circle) would look sharper still at extreme
-  zoom, but that's the "bigger, more complex build" the design doc
-  already deferred (§2) -- this fix closes the *unnecessary* resolution
-  loss without taking on that scope.
+- **Radar render resolution was artificially low, first patched then
+  properly fixed 2026-09-23**: canvas size was a flat 700px regardless
+  of the actual data, ~1315m/pixel for a ~460km-radius circle -- 5.3x
+  coarser than the data's real 250m gate spacing, i.e. genuine
+  thrown-away detail from the renderer, not a real radar limit. First
+  pass sized the canvas off the real data dimensions instead (capped at
+  1800px for compute time), which helped but still didn't hold up under
+  real use on a laptop screen -- superseded same day by the real tile
+  pyramid below, which doesn't have a resolution ceiling from a fixed
+  canvas size at all.
+- **True tile pyramid renderer, built 2026-09-23** (previously deferred
+  same day as "harder than it sounds," then revisited after the
+  interim fix above still didn't feel right in practice): `RadarTileLayer`
+  in `web/app.js`, a real Leaflet `GridLayer` subclass -- each tile
+  actually visible on screen renders fresh at whatever zoom the user is
+  at, instead of one fixed-resolution image for the whole radar circle
+  getting stretched by the browser. Stayed fully client-side, the
+  original hard requirement: no server round-trip per tile/pan/zoom, the
+  data fetch still happens once per scan update exactly as before, only
+  *how* it's drawn from that same data changed.
+  - Tile bounds come from `_tileCoordsToBounds()` (Leaflet's real Web
+    Mercator projection for the tile's corners), then lat/lng is
+    linearly interpolated *within* each small tile -- standard
+    simplification, Mercator curvature inside one 256px tile is well
+    under a pixel at any real zoom level.
+  - Converting a tile pixel's lat/lng back to (range, azimuth) from the
+    site reuses the exact same flat-local-plane approximation already
+    used everywhere else in this file (`kmOffsetToLatLon`,
+    `metersToLatLonBounds`) -- deliberately not introducing real geodesy
+    just for this one piece, and it was already good enough at NEXRAD's
+    ~460km range for everything else.
+  - The "client-side + true tile pyramid is a much harder combination"
+    concern from the original deferral turned out manageable: Leaflet
+    itself handles the zoom-gesture animation (CSS-transforms the
+    currently-loaded tiles smoothly while fetching new ones in the
+    background), so this was never going to require continuous
+    per-frame reprojection during the gesture -- just per-*tile*, same
+    cost profile as any ordinary tile layer.
+  - Dedicated Leaflet pane (`radarTilePane`, z-index 350) added so radar
+    tiles are guaranteed to stack above the basemap and GOES overlay
+    regardless of add/redraw order, rather than depending on DOM
+    insertion order like they would sharing Leaflet's default tile pane.
+  - **Genuinely the highest-risk unverified piece in this whole
+    project.** Leaflet `GridLayer`'s tile lifecycle, the
+    `_tileCoordsToBounds()` dependency (a protected/internal Leaflet
+    method, not officially public API -- stable and commonly used in
+    real plugins across Leaflet 1.x, but not a guaranteed contract),
+    and canvas-per-tile rendering under actual pan/zoom interaction have
+    never been seen in a real browser -- the dev environment this was
+    built in still has none. Reasoned through carefully and reviewed
+    line-by-line, but this is exactly the kind of integration where a
+    subtle bug (tile misalignment, a coordinate sign error, tiles not
+    clearing on redraw) would only show up visually, not as a thrown
+    error. Check this before trusting it.
 - **Camera markers with identical coordinates now grouped** (fixed
   2026-09-23, reported from real use near Evansville, IN): InDOT
   publishes 3 separate real cameras for the same I-64 interchange, all
@@ -289,6 +327,121 @@ requirement of the software itself.
   from 5 flat markers to 3 real distinct locations for the Evansville
   area, with the 3 previously-buried cameras now showing together in one
   popup.
+- **Camera images auto-refresh + fullscreen lightbox, built 2026-09-24**:
+  snapshot URLs are "latest image" endpoints on the source's own server
+  -- the URL string itself never changes when a new frame is captured,
+  so a browser left with a popup open kept showing the frame from
+  whenever it was opened. `refreshVisibleCameraImages()` cache-busts and
+  reloads every camera `<img>` actually in the DOM (popup content is
+  removed from the DOM when a Leaflet popup closes, so this only ever
+  touches images someone can actually see) every 15s. Clicking any
+  camera image opens it fullscreen in a lightbox overlay (click again to
+  close); the lightbox image participates in the same refresh loop.
+- **Multi-state camera coverage + state/territory picker, built
+  2026-09-24** (`camera-state` dropdown in the HUD, "Near radar site"
+  default): originally only IN/IL/WI/KY. Added FL, GA, LA, PA, NC the
+  same day, found by accident -- researching Florida's 511 platform
+  turned up a shared, undocumented DataTables-style API
+  (`/List/GetData/Cameras`) that turned out to be running identically on
+  four more states, just a different domain each time (confirmed live,
+  not assumed). South Carolina, Virginia, Texas, Alabama, Mississippi
+  were tried and don't match this platform -- different systems, not
+  yet researched. `/api/camera-states` reports which states actually
+  have a source; the dropdown lists all 50 states + DC + PR/VI/GU/AS/MP
+  regardless, marking unsupported ones "(no source yet)" rather than
+  hiding them, since the ask was explicitly for hurricane-relevant
+  coverage across the whole US.
+  - **Real pagination problem solved**: the shared platform caps every
+    response at 100 cameras/page server-side no matter what's
+    requested (confirmed live -- asking for 10,000 on Florida's ~4,959
+    still returned 100). A big state needs ~50 sequential requests at
+    ~0.5-0.6s each -- parallelized across a 10-worker thread pool
+    (same pattern as the original two-source camera fetch), cutting
+    Florida's real full fetch from an estimated ~30s to **~5.8s
+    measured live**.
+  - **Deliberately on-demand, not preloaded** -- this was the explicit
+    ask ("not auto-populate all the cameras in the US at once"). Only
+    the state actually selected triggers a fetch; nothing loads for any
+    other state until picked. Separate cache from the near-site one
+    (`_state_camera_cache`, 5min TTL vs. 2min) since a full-state pull
+    is much more expensive to redo.
+  - **Real counts, verified live**: FL 4,787 grouped locations, GA
+    3,095, PA 1,529, NC 1,042, LA 329, SC 787.
+  - **South Carolina added, built 2026-09-24**: different platform than
+    the DataTables one above -- Iteris ATIS
+    (`sc.cdn.iteris-atis.com/geojson/icons/metadata/icons.cameras.geojson`),
+    a plain GeoJSON feed, no pagination needed. `fetch_iteris_cameras()`
+    in `radar_lab.py`. Tried the same `{state}.cdn.iteris-atis.com`
+    pattern against 14 other state codes (VA/AL/MS/TX/TN/OK/AZ/NM/CO/
+    UT/NV/OR/WA/CA) -- all failed, so this is SC-specific, not a second
+    reusable multi-state shortcut. Verified live: 787 grouped cameras,
+    sample image URL followed its redirect to a real `image/png` 200.
+  - **Hazcams added, built 2026-09-24** (Hawaii's `HI` entry in the
+    state dropdown): USGS Hawaiian Volcano Observatory hazard-monitoring
+    webcams (Kilauea + Mauna Loa), not a DOT system at all -- scraped
+    from `volcanoes.usgs.gov/cams/index.php` (`fetch_hazcams()`), no
+    JSON API exists there. No real per-camera coordinates are published,
+    only a shared summit per volcano -- spreading them naively onto that
+    one point collapsed 18-19 real distinct cameras into a single
+    giant-popup marker via the same location-grouping meant for
+    genuinely co-located DOT cameras. Fixed by spreading each camera
+    onto a small ring (~2km) around its volcano's summit. Verified live:
+    31 distinct clickable markers, zero collisions.
+  - **Still not resolved**: Virginia, Texas, Alabama, Mississippi. All
+    four are JS-rendered single-page apps, not plain server-rendered
+    pages -- a curl of the page HTML returns little or no real content.
+    Virginia's Angular bundle (`main-FVQ2IQQK.js`) confirms a real
+    `cameraFeed`/`cameraId` component exists client-side, but the actual
+    backend API URL that populates it wasn't found by searching the
+    bundle for literal `https://` strings -- it's likely built
+    dynamically rather than hardcoded. Real attempts made, not just
+    skipped; genuinely unresolved.
+- **National radar mosaic, built 2026-09-23** (`toggle-mosaic` in the
+  HUD, off by default): NOAA's own pre-merged national composite --
+  MRMS `MergedReflectivityQCComposite`, all ~160 WSR-88D sites already
+  combined by NOAA, no need to merge them ourselves. Real numbers,
+  measured live: ~1.4MB per file, updates ~every 2 minutes (faster than
+  a single site's own 6-7min cadence), polled every
+  `RADAR_LAB_MOSAIC_POLL_INTERVAL_SEC` (default 60s) in its own thread
+  (`mosaic_poll_loop`), independent of whichever single site is
+  currently selected -- switching sites does not affect it.
+  - **Mosaic mode hides the single-site radar layer** (added 2026-09-23,
+    reported from real use as redundant clutter): showing the national
+    composite and the per-panel single-site tiles over the same area at
+    once was confusing, not useful. `setRadarLayersVisible()` toggles
+    each panel's `radarTileLayer` on/off the map based on mosaic state --
+    only visibility changes, the layer keeps fetching and redrawing with
+    current data the whole time it's hidden (`renderPanelRadar` checks
+    `isMosaicActive()` before attaching a newly-created layer, and skips
+    `redraw()`'s tile-reload work via `map.hasLayer()` when hidden), so
+    turning mosaic back off shows current data immediately instead of
+    stale tiles from before it was hidden.
+  - **The one deliberate exception to client-side rendering in this
+    whole app.** The grid is 3500×7000 = 24.5M points -- far too large
+    to ship raw for the browser to draw itself the way single-site data
+    works. `decode_and_render_mosaic()` renders server-side to a
+    1600×800 PNG (~370KB, picked from real measured file-size tradeoffs
+    at several resolutions) using the same `DBZ_STOPS` color scale as
+    the client-side `dbzColor()` (duplicated by hand, not shared code --
+    one's Python, one's JS). "Server-side" here is still the same
+    process on the same machine as everything else -- not a different
+    remote service, see the design doc for why that's not a compromise
+    of the eventual-standalone-laptop goal.
+  - **Real dependency problem found and solved, not just noted**:
+    decoding GRIB2 needs a new library. `cfgrib` (the more common
+    xarray-based reader) decoded real files correctly but **crashed with
+    reproducible memory corruption** (`double free`, then
+    `free(): invalid pointer` on a separate run) during process cleanup,
+    every time it was tested -- a bug in eccodes' own C bindings, not
+    fixable from the Python side. Switched to `pygrib`, a lower-level
+    binding to the same underlying library: zero crashes across 4+
+    repeated decodes of the same file, and ~2x faster (~6.5s vs.
+    cfgrib's ~12-17s). Chosen deliberately for reliability, not
+    discovered by accident.
+  - Verified as a real working pipeline before being wired into the app
+    at all: fetched a live file, decoded it, colorized it, and looked at
+    the actual output image -- real storm cell structure, not noise --
+    before writing a single line of integration code.
 
 ## Known scaffold-level gaps (not bugs, just not done yet)
 

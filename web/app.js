@@ -32,6 +32,29 @@ const DEFAULT_PRODUCTS = ["reflectivity_dbz", "velocity_ms", "zdr_db", "cc"];
 const DEFAULT_CENTER = [38.4, -87.7];
 const DEFAULT_ZOOM = 8;
 
+// All 50 states + DC + the populated territories -- the dropdown lists
+// all of them (2026-09-24, for picking a hurricane-relevant area
+// regardless of whether a camera source is registered there yet), but
+// only some have a real backend source right now (see
+// STATE_DATATABLES_DOMAINS/TRAVELMIDWEST_STATES in radar_lab.py).
+// Picking an unsupported one shows a clear "no source yet" status
+// instead of silently doing nothing.
+const US_STATES = {
+  AL: "Alabama", AK: "Alaska", AZ: "Arizona", AR: "Arkansas", CA: "California",
+  CO: "Colorado", CT: "Connecticut", DE: "Delaware", DC: "District of Columbia",
+  FL: "Florida", GA: "Georgia", HI: "Hawaii", ID: "Idaho", IL: "Illinois",
+  IN: "Indiana", IA: "Iowa", KS: "Kansas", KY: "Kentucky", LA: "Louisiana",
+  ME: "Maine", MD: "Maryland", MA: "Massachusetts", MI: "Michigan", MN: "Minnesota",
+  MS: "Mississippi", MO: "Missouri", MT: "Montana", NE: "Nebraska", NV: "Nevada",
+  NH: "New Hampshire", NJ: "New Jersey", NM: "New Mexico", NY: "New York",
+  NC: "North Carolina", ND: "North Dakota", OH: "Ohio", OK: "Oklahoma", OR: "Oregon",
+  PA: "Pennsylvania", RI: "Rhode Island", SC: "South Carolina", SD: "South Dakota",
+  TN: "Tennessee", TX: "Texas", UT: "Utah", VT: "Vermont", VA: "Virginia",
+  WA: "Washington", WV: "West Virginia", WI: "Wisconsin", WY: "Wyoming",
+  PR: "Puerto Rico", VI: "U.S. Virgin Islands", GU: "Guam",
+  AS: "American Samoa", MP: "Northern Mariana Islands",
+};
+
 // Three basemap choices, all Esri (arcgisonline.com), all free/no-key,
 // all confirmed 2026-09-23 by actually viewing tile pixels (not just
 // checking HTTP status -- CARTO's basemaps.cartocdn.com, the original
@@ -194,62 +217,89 @@ const COLOR_FNS = {
 };
 
 // ---------------------------------------------------------------------
-// Polar -> cartesian raster resample. Cost is fixed at canvasSize^2
-// regardless of ray/gate count, which is what keeps this fast.
-// ---------------------------------------------------------------------
+// True tile pyramid (2026-09-23, V2 upgrade -- previously deferred, see
+// design doc §4). Replaces the old single fixed-resolution raster for
+// the *whole* radar circle (which meant zooming in just stretched an
+// already-rendered image) with a real Leaflet GridLayer: each tile
+// actually on screen is rendered fresh, at whatever zoom the user is
+// at, using the exact same polar (range/azimuth) lookup as before --
+// only *how* it's drawn changes, not the underlying data or the lookup
+// logic itself. Still fully client-side, still no server round-trip per
+// tile/pan/zoom -- the data fetch already happened once per scan
+// update, same as before.
+//
+// Tile bounds come from GridLayer's own _tileCoordsToBounds() (Leaflet's
+// real Web Mercator projection, not an approximation) for the tile's
+// corners, then lat/lng is linearly interpolated *within* the tile --
+// standard simplification for small (256px) tiles, where Mercator
+// curvature inside one tile is well under a pixel regardless of zoom.
+// From there, converting a lat/lng back to (range, azimuth) from the
+// site uses the same flat-local-plane approximation already used
+// everywhere else in this file (kmOffsetToLatLon, metersToLatLonBounds)
+// -- kept consistent rather than introducing real geodesy just for
+// this, and already good enough at NEXRAD's ~460km max range.
+const RadarTileLayer = L.GridLayer.extend({
+  setData(props) {
+    // siteLat, siteLon, azimuths, values, gate0, gateStep, nGate, colorFn
+    Object.assign(this, props);
+    this._maxRange = this.gate0 + this.nGate * this.gateStep;
+    this._cosLat = Math.cos((this.siteLat * Math.PI) / 180);
+  },
 
-function renderRadarCanvas(data, field) {
-  const values = data[field];
-  if (!values) return null;
-  const az = data.azimuths;
-  const nAz = az.length;
-  const nGate = data.ngates;
-  const gate0 = data.gate0_m, gateStep = data.gate_step_m;
-  const maxRange = gate0 + nGate * gateStep;
-  // Size was a flat 700px before -- for a ~460km-radius circle that's
-  // ~1315m/pixel, nearly 5.3x coarser than the data's real 250m gate
-  // spacing (2*maxRange / gateStep ≈ 3680px would be true native
-  // resolution). That's real thrown-away detail, not radar-inherent
-  // graininess -- the underlying data actually supports much sharper
-  // rendering than 700px was giving it. Sized off the real data
-  // dimensions now instead of a flat guess, capped for compute time
-  // (cost is O(size^2) in the resample loop below -- 1800px measured
-  // ~148ms on this dev box (Node/V8) vs. 700px's ~24ms, worth it for a
-  // per-scan render, not framerate-critical).
-  const size = Math.min(Math.round((2 * maxRange) / gateStep), 1800);
-  const canvas = document.createElement("canvas");
-  canvas.width = size; canvas.height = size;
-  const ctx = canvas.getContext("2d");
-  const img = ctx.createImageData(size, size);
-  const colorFn = COLOR_FNS[field] || dbzColor;
+  createTile(coords, done) {
+    const tile = document.createElement("canvas");
+    const size = this.getTileSize();
+    tile.width = size.x;
+    tile.height = size.y;
 
-  for (let py = 0; py < size; py++) {
-    const yM = ((size / 2 - py) / (size / 2)) * maxRange;
-    for (let px = 0; px < size; px++) {
-      const xM = ((px - size / 2) / (size / 2)) * maxRange;
-      const rangeM = Math.sqrt(xM * xM + yM * yM);
-      const idx = (py * size + px) * 4;
-      if (rangeM > maxRange || rangeM < gate0) continue;
-      let azDeg = (Math.atan2(xM, yM) * 180) / Math.PI;
-      if (azDeg < 0) azDeg += 360;
-      const azIdx = Math.round((azDeg / 360) * nAz) % nAz;
-      const gateIdx = Math.floor((rangeM - gate0) / gateStep);
-      if (gateIdx < 0 || gateIdx >= nGate) continue;
-      const row = values[azIdx];
-      if (!row) continue;
-      const v = row[gateIdx];
-      if (v === null || v === undefined) continue;
-      const color = colorFn(v);
-      if (!color) continue;
-      img.data[idx] = color[0];
-      img.data[idx + 1] = color[1];
-      img.data[idx + 2] = color[2];
-      img.data[idx + 3] = 200;
+    if (this.values) {
+      const bounds = this._tileCoordsToBounds(coords);
+      const nw = bounds.getNorthWest(), se = bounds.getSouthEast();
+      const ctx = tile.getContext("2d");
+      const img = ctx.createImageData(size.x, size.y);
+      const nAz = this.azimuths.length;
+      const mPerDegLat = 111320;
+      const mPerDegLon = 111320 * this._cosLat;
+
+      for (let py = 0; py < size.y; py++) {
+        // Row-hoisted like the old renderer -- yM only depends on py,
+        // no reason to recompute it for every px in the row.
+        const lat = nw.lat + ((se.lat - nw.lat) * py) / size.y;
+        const yM = (lat - this.siteLat) * mPerDegLat;
+        for (let px = 0; px < size.x; px++) {
+          const lng = nw.lng + ((se.lng - nw.lng) * px) / size.x;
+          const xM = (lng - this.siteLon) * mPerDegLon;
+          const rangeM = Math.sqrt(xM * xM + yM * yM);
+          if (rangeM > this._maxRange || rangeM < this.gate0) continue;
+          let azDeg = (Math.atan2(xM, yM) * 180) / Math.PI;
+          if (azDeg < 0) azDeg += 360;
+          const azIdx = Math.round((azDeg / 360) * nAz) % nAz;
+          const gateIdx = Math.floor((rangeM - this.gate0) / this.gateStep);
+          if (gateIdx < 0 || gateIdx >= this.nGate) continue;
+          const row = this.values[azIdx];
+          if (!row) continue;
+          const v = row[gateIdx];
+          if (v === null || v === undefined) continue;
+          const color = this.colorFn(v);
+          if (!color) continue;
+          const idx = (py * size.x + px) * 4;
+          img.data[idx] = color[0];
+          img.data[idx + 1] = color[1];
+          img.data[idx + 2] = color[2];
+          img.data[idx + 3] = 200;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
     }
-  }
-  ctx.putImageData(img, 0, 0);
-  return { canvas, maxRange };
-}
+
+    // Leaflet's documented custom-GridLayer pattern: draw synchronously,
+    // return the element immediately, and also call done() to signal
+    // the tile-fade-in lifecycle. setTimeout(...,0) just yields a tick
+    // rather than blocking Leaflet's own bookkeeping.
+    setTimeout(() => done(null, tile), 0);
+    return tile;
+  },
+});
 
 function metersToLatLonBounds(lat, lon, maxRange) {
   const dLat = maxRange / 111320;
@@ -305,6 +355,19 @@ function createPanel(product) {
   }
   baseLayers[baseLayerKey].addTo(map);
 
+  // Dedicated pane so radar tiles are *guaranteed* to render above both
+  // the basemap and the GOES cloud overlay regardless of add/redraw
+  // order -- all three are tile-ish layers, and without an explicit
+  // pane they'd share Leaflet's default tilePane (z-index 200), where
+  // stacking would depend on DOM insertion order instead of being
+  // deterministic (a real risk once radarTileLayer.redraw() starts
+  // manipulating tile DOM nodes on every scan update).
+  map.createPane("radarTilePane").style.zIndex = 350;
+  // National mosaic sits between the basemap/GOES (200) and the
+  // single-site radar tiles (350) -- wide-area context underneath the
+  // primary, more detailed single-site product where they overlap.
+  map.createPane("mosaicPane").style.zIndex = 250;
+
   const panel = {
     container,
     map,
@@ -319,7 +382,7 @@ function createPanel(product) {
                         // data at least once (see renderPanelRadar) --
                         // prevents re-fitting on every later scan update,
                         // which would fight the user's own pan/zoom
-    radarOverlay: null,
+    radarTileLayer: null, // created lazily on first real data, see renderPanelRadar
     cameraLayer: L.layerGroup().addTo(map),
     alertsLayer: L.layerGroup().addTo(map),
     nstLayer: L.layerGroup().addTo(map),
@@ -327,6 +390,7 @@ function createPanel(product) {
     gpsMarker: null,
     gpsTrail: L.polyline([], { color: "#38bdf8", weight: 2 }).addTo(map),
     siteMarkersLayer: L.layerGroup().addTo(map),
+    mosaicOverlay: null, // current national-mosaic imageOverlay, if shown (see refreshMosaic)
   };
 
   select.addEventListener("change", () => {
@@ -404,6 +468,7 @@ function setLayout(n) {
   refreshAlerts();
   refreshLevel3();
   refreshSitePills();
+  refreshMosaic();
 }
 
 // ---------------------------------------------------------------------
@@ -451,15 +516,37 @@ async function renderPanelRadar(panel) {
     const data = await fetchProductData(panel.product, ts, panel.tilt);
     siteLatLon = [data.lat, data.lon];
     syncTiltSelect(panel, data);
-    const result = renderRadarCanvas(data, panel.product);
-    if (!result) {
+    const values = data[panel.product];
+    if (!values) {
       setStatus(`no ${panel.product} in this scan`);
       return;
     }
-    const bounds = metersToLatLonBounds(data.lat, data.lon, result.maxRange);
-    if (panel.radarOverlay) panel.map.removeLayer(panel.radarOverlay);
-    panel.radarOverlay = L.imageOverlay(result.canvas.toDataURL(), bounds, { opacity: 0.75 });
-    panel.radarOverlay.addTo(panel.map);
+    const isNewLayer = !panel.radarTileLayer;
+    if (isNewLayer) panel.radarTileLayer = new RadarTileLayer({ pane: "radarTilePane", opacity: 0.75 });
+    // setData() before addTo()/redraw() so even the very first tile
+    // request already has real data -- otherwise Leaflet's automatic
+    // initial tile load (triggered by addTo) would fire with .values
+    // still unset, rendering a blank first pass that redraw() then has
+    // to immediately redo.
+    panel.radarTileLayer.setData({
+      siteLat: data.lat,
+      siteLon: data.lon,
+      azimuths: data.azimuths,
+      values,
+      gate0: data.gate0_m,
+      gateStep: data.gate_step_m,
+      nGate: data.ngates,
+      colorFn: COLOR_FNS[panel.product] || dbzColor,
+    });
+    // Keep the data current even while hidden (mosaic mode) so it's
+    // ready to show instantly the moment mosaic gets turned back off,
+    // instead of showing stale tiles for a beat -- only whether it's
+    // *attached to the map* depends on mosaic being active.
+    if (isNewLayer) {
+      if (!isMosaicActive()) panel.radarTileLayer.addTo(panel.map);
+    } else if (panel.map.hasLayer(panel.radarTileLayer)) {
+      panel.radarTileLayer.redraw(); // drops currently-loaded tiles, re-requests visible ones with the new data
+    }
     if (!panel.hasAutoFit) {
       // First real data this panel has ever shown -- zoom/pan to frame
       // the radar's actual coverage circle instead of leaving it at the
@@ -467,7 +554,8 @@ async function renderPanelRadar(panel) {
       // radar echo look like a small blob in the corner of a huge
       // multi-state view. Only happens once per panel so it doesn't
       // fight the user's own pan/zoom on every later scan update.
-      panel.map.fitBounds(bounds);
+      const maxRange = data.gate0_m + data.ngates * data.gate_step_m;
+      panel.map.fitBounds(metersToLatLonBounds(data.lat, data.lon, maxRange));
       panel.hasAutoFit = true;
     }
   } catch (e) {
@@ -496,44 +584,104 @@ async function refreshScanList() {
 // drawn into every panel's own layer group.
 // ---------------------------------------------------------------------
 
+function buildCameraPopup(cam) {
+  // Some locations have multiple real cameras at the same coordinates
+  // (found 2026-09-23 near Evansville, IN -- InDOT publishes 3 separate
+  // cameras for one I-64 interchange) -- backend groups those into one
+  // marker with several snapshots instead of stacking identical markers
+  // invisibly on top of each other, which was making all but the
+  // topmost unclickable.
+  const images = (cam.snapshots || [])
+    .map((url) =>
+      `<img src="${url}" class="cam-img" data-base="${url}" ` +
+      `style="max-width:240px;display:block;margin-top:4px;cursor:zoom-in" ` +
+      `onerror="this.style.display='none'">`
+    )
+    .join("");
+  // distance_km only exists in "near radar site" mode, not state mode --
+  // state-scoped results aren't measured against any particular point.
+  const distancePart = cam.distance_km !== undefined ? ` &middot; ${cam.distance_km} km` : "";
+  const countPart = cam.snapshots?.length > 1 ? ` &middot; ${cam.snapshots.length} cameras` : "";
+  return `<b>${cam.name || cam.id}</b><br>${cam.src || ""}${distancePart}${countPart}<br>${images}`;
+}
+
 async function refreshCameras() {
   const on = document.getElementById("toggle-cameras").checked;
-  if (!on || !siteLatLon) {
+  const stateCode = document.getElementById("camera-state").value;
+  if (!on || (!stateCode && !siteLatLon)) {
     panels.forEach((p) => p.cameraLayer.clearLayers());
     return;
   }
   try {
-    const { cameras } = await fetchJSON(
-      `/api/cameras?lat=${siteLatLon[0]}&lon=${siteLatLon[1]}&radius_km=75`
-    );
+    // Two modes (2026-09-24): "near radar site" (original behavior,
+    // distance-filtered around wherever the active radar is) or a
+    // specific state/territory the user picked explicitly -- picking a
+    // state is the *only* thing that triggers fetching that state's
+    // cameras; nothing is ever preloaded for states not selected.
+    const url = stateCode
+      ? `/api/cameras?state=${encodeURIComponent(stateCode)}`
+      : `/api/cameras?lat=${siteLatLon[0]}&lon=${siteLatLon[1]}&radius_km=75`;
+    const { cameras } = await fetchJSON(url);
     panels.forEach((p) => {
       p.cameraLayer.clearLayers();
       for (const cam of cameras) {
-        // Some locations have multiple real cameras at the same
-        // coordinates (found 2026-09-23 near Evansville, IN -- InDOT
-        // publishes 3 separate cameras for one I-64 interchange) --
-        // backend groups those into one marker with several snapshots
-        // instead of stacking identical markers invisibly on top of
-        // each other, which was making all but the topmost unclickable.
-        const images = (cam.snapshots || [])
-          .map((url) =>
-            `<img src="${url}" style="max-width:240px;display:block;margin-top:4px" ` +
-            `onerror="this.style.display='none'">`
-          )
-          .join("");
         L.circleMarker([cam.lat, cam.lon], { radius: 8, color: "#facc15", fillOpacity: 0.6 })
-          .bindPopup(
-            `<b>${cam.name || cam.id}</b><br>${cam.src || ""} &middot; ${cam.distance_km} km` +
-            `${cam.snapshots?.length > 1 ? ` &middot; ${cam.snapshots.length} cameras` : ""}<br>` +
-            images
-          )
+          .bindPopup(buildCameraPopup(cam))
           .addTo(p.cameraLayer);
       }
     });
+    setStatus(`showing ${cameras.length} camera${cameras.length === 1 ? "" : "s"}` +
+      (stateCode ? ` in ${stateCode}` : ""));
   } catch (e) {
+    // fetchJSON surfaces the real backend message (e.g. "no camera
+    // source registered for TX yet") on a non-OK response, not just a
+    // generic HTTP code -- see fetchJSON's own comment for why that
+    // matters.
     console.error("camera fetch failed", e);
+    setStatus(`cameras: ${e.message}`);
+    panels.forEach((p) => p.cameraLayer.clearLayers());
   }
 }
+
+// Camera snapshot URLs are "latest image" endpoints on the source's own
+// server (the URL string itself never changes) -- browsers happily cache
+// that, so a popup left open would keep showing the frame from whenever
+// it was opened. Cache-bust and reload anything actually visible (popup
+// content only exists in the DOM while its popup is open, so this never
+// touches closed/off-screen cameras) plus the lightbox image if it's up.
+let lightboxEl = null;
+function refreshVisibleCameraImages() {
+  document.querySelectorAll("img.cam-img").forEach((img) => {
+    const base = img.dataset.base;
+    if (!base) return;
+    img.src = base + (base.includes("?") ? "&" : "?") + "_ts=" + Date.now();
+  });
+}
+setInterval(refreshVisibleCameraImages, 15000);
+
+function openCameraLightbox(url) {
+  if (!lightboxEl) {
+    lightboxEl = document.createElement("div");
+    lightboxEl.id = "camera-lightbox";
+    lightboxEl.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:5000;" +
+      "display:none;align-items:center;justify-content:center;cursor:zoom-out";
+    lightboxEl.innerHTML =
+      '<img id="camera-lightbox-img" class="cam-img" style="max-width:95vw;max-height:95vh;">';
+    lightboxEl.addEventListener("click", () => { lightboxEl.style.display = "none"; });
+    document.body.appendChild(lightboxEl);
+  }
+  const img = document.getElementById("camera-lightbox-img");
+  img.dataset.base = url;
+  img.src = url;
+  lightboxEl.style.display = "flex";
+}
+
+document.addEventListener("click", (e) => {
+  if (e.target.classList && e.target.classList.contains("cam-img") && e.target.id !== "camera-lightbox-img") {
+    openCameraLightbox(e.target.dataset.base);
+  }
+});
 
 async function refreshAlerts() {
   const on = document.getElementById("toggle-alerts").checked;
@@ -684,11 +832,38 @@ for (const id of ["toggle-cameras", "toggle-alerts", "toggle-nst", "toggle-nmd",
   });
 }
 
+document.getElementById("camera-state").addEventListener("change", refreshCameras);
+
 document.getElementById("toggle-site-pills").addEventListener("change", refreshSitePills);
+document.getElementById("toggle-mosaic").addEventListener("change", (e) => {
+  mosaicUpdated = null; // force a real refetch even if the meta timestamp hasn't changed
+  setRadarLayersVisible(!e.target.checked);
+  refreshMosaic();
+});
 
 // ---------------------------------------------------------------------
 // Radar site switching
 // ---------------------------------------------------------------------
+
+async function loadCameraStateOptions() {
+  const select = document.getElementById("camera-state");
+  let supported = new Set();
+  try {
+    const data = await fetchJSON("/api/camera-states");
+    supported = new Set(data.supported);
+  } catch (e) {
+    console.error("camera-states fetch failed", e);
+  }
+  for (const [code, name] of Object.entries(US_STATES)) {
+    const opt = document.createElement("option");
+    opt.value = code;
+    // Not disabling unsupported ones -- picking one still gives useful
+    // feedback (a clear "no source yet" status) rather than being
+    // unselectable with no explanation at all.
+    opt.textContent = supported.has(code) ? `${name}` : `${name} (no source yet)`;
+    select.appendChild(opt);
+  }
+}
 
 async function loadSiteList() {
   try {
@@ -719,15 +894,79 @@ function refreshSitePills() {
     p.siteMarkersLayer.clearLayers();
     if (!on) continue;
     for (const s of siteList) {
+      // iconSize: null (the original version of this) is not
+      // well-defined L.divIcon usage -- Leaflet's internal size/anchor
+      // math has undocumented behavior for it. Found live 2026-09-23:
+      // pills rendered wildly oversized (tens to hundreds of km across
+      // on screen), and since real neighboring NEXRAD sites are spaced
+      // ~150-260km apart nationally, oversized pills for a site's
+      // several real neighbors visually merged into a single connected
+      // blob -- looked exactly like a giant, geometrically-impossible
+      // radar echo, but was pure CSS/icon-sizing, nothing to do with
+      // radar data at all. Fixed with the standard robust pattern for a
+      // text-label divIcon: a deterministic near-zero icon box with no
+      // Leaflet-side anchor offset, and let the CSS transform on
+      // .site-pill (translate(-50%,-50%)) do all the actual centering
+      // against the marker's real lat/lng point -- one mechanism, not
+      // two different ones fighting each other.
       const icon = L.divIcon({
         className: "site-pill-wrap",
         html: `<span class="site-pill${s.id === currentSite ? " site-pill-active" : ""}">${s.id}</span>`,
-        iconSize: null,
+        iconSize: [1, 1],
+        iconAnchor: [0, 0],
       });
       L.marker([s.lat, s.lon], { icon, interactive: true })
         .on("click", () => switchSite(s.id))
         .addTo(p.siteMarkersLayer);
     }
+  }
+}
+
+let mosaicUpdated = null; // last-known server render timestamp, avoids reloading an unchanged image
+
+function isMosaicActive() {
+  return document.getElementById("toggle-mosaic").checked;
+}
+
+// Showing both the single-site radar and the national mosaic at once is
+// redundant clutter over the same area -- mosaic mode hides the
+// per-panel radar tile layer instead of layering on top of it. Only
+// visibility toggles (map.addLayer/removeLayer); the layer keeps
+// fetching and redrawing with current data in the background the whole
+// time (see renderPanelRadar), so turning mosaic back off shows current
+// data immediately instead of stale tiles from before it was hidden.
+function setRadarLayersVisible(show) {
+  for (const p of panels) {
+    if (!p.radarTileLayer) continue;
+    const isShown = p.map.hasLayer(p.radarTileLayer);
+    if (show && !isShown) p.radarTileLayer.addTo(p.map);
+    else if (!show && isShown) p.map.removeLayer(p.radarTileLayer);
+  }
+}
+
+async function refreshMosaic() {
+  const on = document.getElementById("toggle-mosaic").checked;
+  if (!on) {
+    for (const p of panels) {
+      if (p.mosaicOverlay) { p.map.removeLayer(p.mosaicOverlay); p.mosaicOverlay = null; }
+    }
+    return;
+  }
+  try {
+    const meta = await fetchJSON("/api/mosaic");
+    if (meta.updated === mosaicUpdated) return; // server hasn't rendered a newer one yet
+    mosaicUpdated = meta.updated;
+    // Cache-bust on the server's own render timestamp (not Date.now())
+    // -- only actually refetches the image when there's a genuinely new
+    // one, instead of every tick() regardless of whether anything changed.
+    const url = `/api/mosaic.png?t=${encodeURIComponent(meta.updated)}`;
+    for (const p of panels) {
+      if (p.mosaicOverlay) p.map.removeLayer(p.mosaicOverlay);
+      p.mosaicOverlay = L.imageOverlay(url, meta.bounds, { pane: "mosaicPane", opacity: 0.6 });
+      p.mosaicOverlay.addTo(p.map);
+    }
+  } catch (e) {
+    console.error("mosaic fetch failed", e);
   }
 }
 
@@ -751,7 +990,7 @@ async function switchSite(newSite) {
   for (const p of panels) {
     p.hasAutoFit = false; // let the new site's first scan re-frame the view
     p.tilt = 0; // a different site/VCP may not even have the same tilt count
-    if (p.radarOverlay) { p.map.removeLayer(p.radarOverlay); p.radarOverlay = null; }
+    if (p.radarTileLayer) { p.map.removeLayer(p.radarTileLayer); p.radarTileLayer = null; }
   }
 
   // Real measured latency: the backend needs ~8-10s to fetch + decode
@@ -793,7 +1032,7 @@ async function tick() {
     // camera endpoint can take 1-3s on a cache miss, see
     // get_cameras()/CAMERA_CACHE_SEC in radar_lab.py) delayed everything
     // listed after it for no reason, every single tick.
-    await Promise.all([refreshCameras(), refreshAlerts(), refreshLevel3()]);
+    await Promise.all([refreshCameras(), refreshAlerts(), refreshLevel3(), refreshMosaic()]);
   } catch (e) {
     setStatus(`status error: ${e.message}`);
   }
@@ -824,6 +1063,7 @@ window.addEventListener("resize", () => {
 });
 
 setLayout(1);
+loadCameraStateOptions();
 loadSiteList().then(tick); // populate the dropdown before tick() tries to select the current site in it
 setInterval(tick, 30000);
 setInterval(refreshGps, 3000);

@@ -10,13 +10,24 @@ a real dependency stack (Py-ART, MetPy, numpy) because actual radar-data
 decoding requires it. That's an explicitly-accepted cost, not a mistake.
 
 Client-side rendering: this backend decodes and serves plain JSON (radial
-arrays, not images). The browser (web/app.js) does all the drawing. See
-design doc §2 for why.
+arrays, not images) for single-site NEXRAD data. The browser (web/app.js)
+does all the drawing. See design doc §2 for why.
+
+One deliberate exception (2026-09-23): the national MRMS radar mosaic
+(/api/mosaic.png) is rendered server-side to a PNG. That data is a
+24.5-million-point national grid -- too large to ship as raw JSON for
+client-side rendering the way single-site data works. "Server-side" here
+still just means this same process, on whatever machine runs it (today
+homehub, eventually the field laptop) -- not a separate remote service.
 """
 import datetime as dt
+import gzip
+import html
+import io
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -28,7 +39,10 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import numpy as np
 import pyart
+import pygrib
+from PIL import Image
 
 BASE = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE / "web"
@@ -56,6 +70,30 @@ CACHE_MINUTES = int(ENV.get("RADAR_LAB_CACHE_MINUTES", "90"))
 L2_BUCKET = "https://unidata-nexrad-level2.s3.amazonaws.com"
 L3_BUCKET = "https://unidata-nexrad-level3.s3.amazonaws.com"
 NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+
+# MRMS national composite (2026-09-23) -- verified live, no auth needed,
+# real cadence ~2min (faster than a single NEXRAD site's own 6-7min
+# volume scan). Poll a bit faster than that cadence for margin, same
+# pattern as POLL_INTERVAL_SEC vs. the real NEXRAD update rate.
+MRMS_BUCKET = "https://noaa-mrms-pds.s3.amazonaws.com"
+MRMS_PRODUCT_PREFIX = "CONUS/MergedReflectivityQCComposite_00.50"
+MOSAIC_POLL_INTERVAL_SEC = int(ENV.get("RADAR_LAB_MOSAIC_POLL_INTERVAL_SEC", "60"))
+# Output size, not native grid size (3500x7000 native) -- measured
+# 2026-09-23: 1600x800 is ~370KB as a PNG, a reasonable size for a
+# wide-area context layer over a real (possibly cellular/Funnel)
+# connection. This is a national overview, not the primary interactive
+# product, so native-resolution sharpness matters much less here than
+# it did for the single-site tile pyramid.
+MOSAIC_WIDTH, MOSAIC_HEIGHT = 1600, 800
+# Same color stops as dbzColor() in web/app.js, kept in sync by hand --
+# duplicated (not shared) because one is JS running in the browser and
+# this one is Python running server-side for the mosaic PNG specifically.
+DBZ_STOPS = [
+    (5, (0x40, 0xe0, 0xd0)), (15, (0x00, 0x90, 0x00)), (25, (0x00, 0xe0, 0x00)),
+    (30, (0xff, 0xff, 0x00)), (35, (0xff, 0xc0, 0x00)), (40, (0xff, 0x80, 0x00)),
+    (45, (0xff, 0x00, 0x00)), (50, (0xc0, 0x00, 0x00)), (55, (0xff, 0x00, 0xff)),
+    (65, (0xff, 0xff, 0xff)),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +327,12 @@ class Cache:
         # V1 scope limit, not an oversight.
         self.latest_raw_l2: tuple[str, bytes] | None = None  # (ts, raw)
         self.tilt_cache: dict[int, dict] = {}  # tilt_index -> decoded, latest scan only
+        # National MRMS mosaic -- deliberately NOT touched by set_site()
+        # below, since it's a national product independent of whichever
+        # single NEXRAD site is currently selected.
+        self.mosaic_png: bytes | None = None
+        self.mosaic_bounds: list | None = None
+        self.mosaic_updated: str | None = None
 
     def set_site(self, new_site: str):
         # Switching sites: old scans/level3 data belong to the old site
@@ -355,6 +399,16 @@ class Cache:
         with self.lock:
             return self.level3.get(product)
 
+    def set_mosaic(self, png: bytes, bounds: list):
+        with self.lock:
+            self.mosaic_png = png
+            self.mosaic_bounds = bounds
+            self.mosaic_updated = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def get_mosaic(self) -> tuple[bytes | None, list | None, str | None]:
+        with self.lock:
+            return self.mosaic_png, self.mosaic_bounds, self.mosaic_updated
+
 
 def _parse_ts(key: str) -> dt.datetime:
     # KVWX20260923_030241_V06 -> datetime
@@ -413,6 +467,96 @@ def poll_loop():
         # up to POLL_INTERVAL_SEC for the new site's first scan.
         POLL_WAKE.wait(POLL_INTERVAL_SEC)
         POLL_WAKE.clear()
+
+
+# ---------------------------------------------------------------------------
+# MRMS national radar mosaic (2026-09-23) -- see design doc §4 for the full
+# story: this is the one place in the whole app that renders an image
+# server-side instead of shipping raw data for the browser to draw. Not a
+# different "remote service" -- this is the exact same process, wherever
+# it happens to be running (homehub today, the field laptop eventually).
+#
+# Library note: cfgrib (the more common xarray-based GRIB2 reader)
+# decoded real MRMS files correctly but crashed with a reproducible
+# memory-corruption error ("double free" / "invalid pointer") on process
+# cleanup every time it was tested, in a way traced to eccodes' own C
+# bindings, not fixable from the Python side. pygrib -- a more direct,
+# lower-level binding to the same underlying library -- decoded the same
+# files cleanly across repeated runs with no crash, and was faster besides
+# (~6.5s vs. cfgrib's ~12-17s). Used deliberately for that reason, not by
+# default/convenience.
+# ---------------------------------------------------------------------------
+
+def latest_mrms_key() -> str | None:
+    today = dt.datetime.now(dt.timezone.utc)
+    for days_back in (0, 1):
+        d = today - dt.timedelta(days=days_back)
+        prefix = f"{MRMS_PRODUCT_PREFIX}/{d:%Y%m%d}/"
+        keys = [k for k in s3_list(MRMS_BUCKET, prefix, 1000) if k.endswith(".grib2.gz")]
+        if keys:
+            return sorted(keys)[-1]
+    return None
+
+
+def decode_and_render_mosaic(raw_gz: bytes) -> tuple[bytes, list]:
+    """Returns (png_bytes, bounds) where bounds is
+    [[south, west], [north, east]] in real -180..180 longitude, ready for
+    a Leaflet imageOverlay. Real measured cost 2026-09-23: ~6.5s decode +
+    ~2.3s vectorized colorize + ~0.4s resize/encode, ~9-10s total."""
+    raw = gzip.decompress(raw_gz)
+    with tempfile.NamedTemporaryFile(suffix=".grib2") as f:
+        f.write(raw)
+        f.flush()
+        grbs = pygrib.open(f.name)
+        grb = grbs[1]
+        data, lats, lons = grb.data()
+        missing = grb.missingValue
+        grbs.close()
+
+    arr = np.asarray(data, dtype="float32")
+    h, w = arr.shape
+    rgba = np.zeros((h, w, 4), dtype="uint8")
+    # missingValue is 9999 for this product (verified live, not assumed --
+    # dBZ never legitimately gets close to that) -- treat separately from
+    # "below 5 dBZ", which dbzColor() on the frontend also renders as
+    # transparent (no significant echo) rather than a real "no data" gap.
+    valid = (arr < missing - 1) & (arr >= 5)
+    for threshold, color in DBZ_STOPS:
+        mask = valid & (arr >= threshold)
+        rgba[mask, 0], rgba[mask, 1], rgba[mask, 2], rgba[mask, 3] = *color, 200
+
+    img = Image.fromarray(rgba, "RGBA").resize((MOSAIC_WIDTH, MOSAIC_HEIGHT), Image.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+
+    # Grid comes back north-at-top (row 0 = highest latitude) -- verified
+    # live, matches image row order directly, no vertical flip needed.
+    # Longitude comes back in 0-360 convention (e.g. 230..300) -- convert
+    # to the -180..180 range Leaflet/everything else in this app expects.
+    def to_signed_lon(lon):
+        return lon - 360 if lon > 180 else lon
+
+    bounds = [
+        [float(lats.min()), to_signed_lon(float(lons.min()))],
+        [float(lats.max()), to_signed_lon(float(lons.max()))],
+    ]
+    return buf.getvalue(), bounds
+
+
+def mosaic_poll_loop():
+    last_key = None
+    while True:
+        try:
+            key = latest_mrms_key()
+            if key and key != last_key:
+                raw_gz = s3_fetch(MRMS_BUCKET, key)
+                png, bounds = decode_and_render_mosaic(raw_gz)
+                CACHE.set_mosaic(png, bounds)
+                last_key = key
+                print(f"[radar-lab] new mosaic: {key} ({len(png)} bytes)")
+        except Exception as e:  # noqa: BLE001 -- poller must never die
+            print(f"[radar-lab] mosaic poll error: {e}")
+        time.sleep(MOSAIC_POLL_INTERVAL_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +656,239 @@ def group_cameras_by_location(cams: list[dict]) -> list[dict]:
         }
         for g in groups.values()
     ]
+
+
+def parse_wkt_point(wkt: str) -> tuple[float, float] | None:
+    # "POINT (-80.892882 26.17325)" -> (lon, lat)
+    try:
+        inner = wkt.split("(")[1].split(")")[0]
+        lon_str, lat_str = inner.split()
+        return float(lon_str), float(lat_str)
+    except (IndexError, ValueError):
+        return None
+
+
+# States confirmed 2026-09-24 running the same shared 511-platform
+# camera API (found by accident researching Florida, then confirmed
+# identical -- just a different domain -- on four more states in
+# minutes). Not every state's 511 system uses this platform -- South
+# Carolina uses a different one (see STATE_ITERIS_GEOJSON_URLS below);
+# Virginia, Texas, Alabama, Mississippi are all JS-rendered SPAs whose
+# real API endpoint hasn't been found yet. This list is expected to grow.
+STATE_DATATABLES_DOMAINS = {
+    "FL": "fl511.com",
+    "GA": "511ga.org",
+    "LA": "511la.org",
+    "PA": "511pa.com",
+    "NC": "www.drivenc.gov",
+}
+# IN/IL/WI all come from one shared multi-state feed (see
+# fetch_travelmidwest_cameras) -- filtered by id prefix per state here.
+TRAVELMIDWEST_STATES = {"IN", "IL", "WI"}
+
+
+def fetch_datatables_cameras(domain: str, state_code: str, page_size: int = 100, max_pages: int = 60) -> list[dict]:
+    """Generic fetcher for the shared 511-platform camera API. Server
+    enforces a 100-per-page cap regardless of what's requested
+    (confirmed live 2026-09-24 -- asking for length=10000 on Florida's
+    ~4959 cameras still only returned 100), so a state the size of
+    Florida needs ~50 paginated requests. Sequential that's ~30s+
+    (~0.5-0.6s/page measured); parallelized across a thread pool like
+    the two-source camera fetch already does, real time drops to a few
+    seconds. max_pages is a hard safety cap (6000 cameras' worth), not
+    expected to actually bind for any current source."""
+    base = f"https://{domain}"
+
+    def fetch_page(start: int) -> dict:
+        req = urllib.request.Request(
+            f"{base}/List/GetData/Cameras",
+            data=f"draw=1&start={start}&length={page_size}".encode(),
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; radar-lab)",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+
+    first = fetch_page(0)
+    total = first.get("recordsTotal", 0)
+    pages_needed = min((total + page_size - 1) // page_size, max_pages)
+    all_rows = list(first.get("data", []))
+
+    if pages_needed > 1:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(fetch_page, p * page_size) for p in range(1, pages_needed)]
+            for future in futures:
+                try:
+                    all_rows.extend(future.result().get("data", []))
+                except Exception as e:  # noqa: BLE001
+                    print(f"[radar-lab] {domain} page fetch error: {e}")
+
+    out = []
+    for row in all_rows:
+        images = row.get("images") or []
+        if not images or not images[0].get("imageUrl"):
+            continue
+        image_url = images[0]["imageUrl"]
+        point = parse_wkt_point((row.get("latLng") or {}).get("geography", {}).get("wellKnownText", ""))
+        if not point:
+            continue
+        lon, lat = point
+        roadway, direction = row.get("roadway"), row.get("direction")
+        name = f"{roadway} {direction}".strip() if roadway else (row.get("location") or f"Camera {row.get('id')}")
+        out.append({
+            "id": f"{state_code}-{row.get('id')}",
+            "name": name,
+            "src": row.get("source") or state_code,
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url if image_url.startswith("http") else f"{base}{image_url}",
+        })
+    return out
+
+
+# USGS Hawaiian Volcano Observatory "HazCams" (2026-09-24) -- real
+# hazard-monitoring webcams for Kilauea and Mauna Loa. Genuinely
+# different in kind from the DOT traffic cameras (a different agency,
+# different purpose), but publicly free the same way, and the user
+# explicitly asked about hazcams as a category. No JSON API found for
+# this -- the real listing lives at volcanoes.usgs.gov/cams/index.php as
+# plain HTML links (each "<a ... cam=K2cam>[K2cam] description</a>"),
+# and each camera's live image is a simple, predictable
+# /cams/{code}/images/M.jpg -- both confirmed live 2026-09-24, not
+# assumed. Alaska (AVO) and Cascades (CVO) volcano observatories were
+# checked and don't appear to have an equivalent accessible system --
+# Hawaii only for now, a real scope limit, not an oversight.
+HAZCAM_BASE = "https://volcanoes.usgs.gov"
+HAZCAM_INDEX_URL = f"{HAZCAM_BASE}/cams/index.php"
+# No real per-camera coordinates are published on the index page --
+# grouped by volcano summit instead (same grouping mechanism already
+# used for DOT cameras stacked at one physical interchange). Which code
+# belongs to which volcano is read straight off each camera's own real
+# name/description (checked 2026-09-24), not guessed.
+MAUNA_LOA_HAZCAMS = {
+    "MOcam", "SPcam", "MSTcam", "HLcam", "MLcam", "MTcam",
+    "MKcam", "MK2cam", "M2cam", "M3cam", "MSPcam", "MDLcam",
+}
+KILAUEA_SUMMIT = (19.4069, -155.2834)
+MAUNA_LOA_SUMMIT = (19.4721, -155.6059)
+
+
+def fetch_hazcams() -> list[dict]:
+    req = urllib.request.Request(HAZCAM_INDEX_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        page = resp.read().decode("utf-8", errors="replace")
+    out = []
+    # All cameras at one volcano share that volcano's single summit
+    # coordinate (no real per-camera coordinates are published) -- found
+    # live 2026-09-24 that group_cameras_by_location() then collapses
+    # ALL of them into one marker (19 different real cameras stacked in
+    # one popup), which is real data but bad UX here: unlike the DOT
+    # camera case this groups for (several genuinely co-located cameras
+    # at one interchange), these are ~18-19 *different* real cameras
+    # that just don't have individual coordinates. Spread each one onto
+    # a small ring (~2km radius) around its volcano's summit so they
+    # render as distinct, individually-clickable markers instead.
+    counts = {KILAUEA_SUMMIT: 0, MAUNA_LOA_SUMMIT: 0}
+    for m in re.finditer(r'<a[^>]*cam=([A-Za-z0-9_]+)[^>]*>(.*?)</a>', page, re.DOTALL):
+        code = m.group(1)
+        name = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+        name = re.sub(r"^\[[A-Za-z0-9_]+\]\s*", "", name)  # drop the leading "[K2cam] " the page prefixes each label with
+        summit = MAUNA_LOA_SUMMIT if code in MAUNA_LOA_HAZCAMS else KILAUEA_SUMMIT
+        i, counts[summit] = counts[summit], counts[summit] + 1
+        angle = (i / 20) * 2 * math.pi  # 20 > real per-volcano count (~18-19), avoids angle collisions
+        ring_deg = 0.018  # ~2km at this latitude
+        lat = summit[0] + ring_deg * math.cos(angle)
+        lon = summit[1] + ring_deg * math.sin(angle) / math.cos(math.radians(summit[0]))
+        out.append({
+            "id": f"HI-{code}",
+            "name": name or code,
+            "src": "USGS HVO",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": f"{HAZCAM_BASE}/cams/{code}/images/M.jpg",
+        })
+    return out
+
+
+# South Carolina runs a different 511 platform than the DataTables one
+# above (Iteris ATIS) -- confirmed 2026-09-24 via its public GeoJSON feed,
+# 790 real cameras with real image URLs. Tried the same {state}.cdn.iteris-
+# atis.com pattern against 14 other state codes (VA/AL/MS/TX/TN/OK/AZ/NM/
+# CO/UT/NV/OR/WA/CA) -- all failed, so this is SC-specific, not a second
+# reusable multi-state shortcut like STATE_DATATABLES_DOMAINS was.
+STATE_ITERIS_GEOJSON_URLS = {
+    "SC": "https://sc.cdn.iteris-atis.com/geojson/icons/metadata/icons.cameras.geojson",
+}
+
+
+def fetch_iteris_cameras(url: str, state_code: str) -> list[dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        geom = feat.get("geometry", {})
+        coords = geom.get("coordinates")
+        image_url = props.get("image_url")
+        if not coords or not image_url:
+            continue
+        lon, lat = coords[0], coords[1]
+        route, direction = props.get("route"), props.get("direction")
+        name = props.get("description") or (f"{route} {direction}".strip() if route else f"Camera {props.get('id')}")
+        out.append({
+            "id": f"{state_code}-{props.get('id')}",
+            "name": name,
+            "src": route or state_code,
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# Separate from _camera_cache (the near-radar-site 4-state one) --
+# whole-state pulls are much more expensive (many paginated requests for
+# a big state), so cached longer (5min not 2min) and only ever fetched
+# for a state someone actually picked, never preloaded speculatively.
+_state_camera_cache: dict[str, dict] = {}
+STATE_CAMERA_CACHE_SEC = 300
+SUPPORTED_CAMERA_STATES = sorted(
+    set(STATE_DATATABLES_DOMAINS) | set(STATE_ITERIS_GEOJSON_URLS) | TRAVELMIDWEST_STATES | {"KY", "HI"}
+)
+
+
+def get_cameras_for_state(state_code: str) -> list[dict] | None:
+    """None means no source registered for this state (yet) -- a real,
+    honest "not supported" distinct from "supported, zero cameras found
+    right now", which the frontend shows differently."""
+    state_code = state_code.upper()
+    now = time.time()
+    cached = _state_camera_cache.get(state_code)
+    if cached and now - cached["ts"] < STATE_CAMERA_CACHE_SEC:
+        return cached["data"]
+
+    if state_code in STATE_DATATABLES_DOMAINS:
+        cams = fetch_datatables_cameras(STATE_DATATABLES_DOMAINS[state_code], state_code)
+    elif state_code in STATE_ITERIS_GEOJSON_URLS:
+        cams = fetch_iteris_cameras(STATE_ITERIS_GEOJSON_URLS[state_code], state_code)
+    elif state_code in TRAVELMIDWEST_STATES:
+        cams = [c for c in fetch_travelmidwest_cameras() if str(c.get("id", "")).startswith(f"{state_code}-")]
+    elif state_code == "KY":
+        cams = fetch_kytc_cameras()
+    elif state_code == "HI":
+        cams = fetch_hazcams()  # not DOT cameras -- USGS volcano hazard webcams
+    else:
+        return None
+
+    grouped = group_cameras_by_location(cams)
+    _state_camera_cache[state_code] = {"data": grouped, "ts": now}
+    return grouped
 
 
 def get_cameras() -> list[dict]:
@@ -646,11 +1023,21 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[radar-lab] {self.address_string()} - {fmt % args}")
 
     def _json(self, obj, code=200):
+        # Radar payloads (esp. /api/reflectivity) run 5-8 MB of raw JSON --
+        # fine over LAN/tailnet (instant), but nearly unusable over a real
+        # internet connection (looked like a permanently "stuck loading"
+        # page to a Funnel user on cellular, root-caused 2026-09-23). JSON
+        # arrays of numbers compress very well, so gzip when the client
+        # supports it (every real browser does).
         body = json.dumps(obj).encode()
+        headers = {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+        if "gzip" in self.headers.get("Accept-Encoding", "") and len(body) > 1024:
+            body = gzip.compress(body, compresslevel=6)
+            headers["Content-Encoding"] = "gzip"
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        for k, v in headers.items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -666,6 +1053,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _binary(self, body: bytes, content_type: str, code=200):
+        # PNG is already compressed (internal zlib deflate) -- unlike
+        # _json's payloads, gzipping on top wouldn't meaningfully shrink
+        # it further, so this doesn't reuse _json's gzip logic.
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -761,13 +1159,42 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/level3/nmd":
             self._json(CACHE.get_level3("NMD") or {"points": []})
 
+        elif path == "/api/mosaic":
+            _png, bounds, updated = CACHE.get_mosaic()
+            if bounds is None:
+                self._json({"error": "no mosaic rendered yet"}, 503)
+                return
+            self._json({"bounds": bounds, "updated": updated})
+
+        elif path == "/api/mosaic.png":
+            png, _bounds, _updated = CACHE.get_mosaic()
+            if png is None:
+                self.send_error(503)
+                return
+            self._binary(png, "image/png")
+
         elif path == "/api/cameras":
+            state_param = qs.get("state", [None])[0]
+            if state_param:
+                # State-scoped mode (2026-09-24): the user explicitly
+                # picks a state/territory instead of always searching
+                # near whichever radar site is active -- deliberately
+                # only ever fetches the one state asked for, never
+                # preloads others, so picking a state is the only thing
+                # that costs a real fetch.
+                cams = get_cameras_for_state(state_param)
+                if cams is None:
+                    self._json({"error": f"no camera source registered for {state_param.upper()} yet",
+                                "supported": SUPPORTED_CAMERA_STATES}, 404)
+                    return
+                self._json({"cameras": cams, "state": state_param.upper()})
+                return
             try:
                 lat = float(qs["lat"][0])
                 lon = float(qs["lon"][0])
                 radius_km = float(qs.get("radius_km", ["50"])[0])
             except (KeyError, ValueError):
-                self._json({"error": "lat & lon query params required"}, 400)
+                self._json({"error": "lat & lon, or state, query param required"}, 400)
                 return
             cams = get_cameras()
             nearby = [
@@ -777,6 +1204,9 @@ class Handler(BaseHTTPRequestHandler):
             nearby = [c for c in nearby if c["distance_km"] <= radius_km]
             nearby.sort(key=lambda c: c["distance_km"])
             self._json({"cameras": nearby})
+
+        elif path == "/api/camera-states":
+            self._json({"supported": SUPPORTED_CAMERA_STATES})
 
         elif path == "/api/alerts":
             try:
@@ -804,8 +1234,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     threading.Thread(target=poll_loop, daemon=True).start()
+    threading.Thread(target=mosaic_poll_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[radar-lab] serving on :{PORT}, site={SITE}, poll every {POLL_INTERVAL_SEC}s")
+    print(f"[radar-lab] serving on :{PORT}, site={SITE}, poll every {POLL_INTERVAL_SEC}s, "
+          f"mosaic every {MOSAIC_POLL_INTERVAL_SEC}s")
     server.serve_forever()
 
 

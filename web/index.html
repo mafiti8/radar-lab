@@ -98,11 +98,15 @@
     <button id="live">Live</button>
   </div>
   <label class="row"><input type="checkbox" id="toggle-cameras" checked> DOT cameras</label>
+  <label>Camera area
+    <select id="camera-state"><option value="">Near radar site</option></select>
+  </label>
   <label class="row"><input type="checkbox" id="toggle-alerts" checked> NWS alerts</label>
   <label class="row"><input type="checkbox" id="toggle-gps" checked> GPS position</label>
   <label class="row"><input type="checkbox" id="toggle-nst" checked> Storm tracks (NST)</label>
   <label class="row"><input type="checkbox" id="toggle-nmd" checked> Mesocyclone (NMD)</label>
   <label class="row"><input type="checkbox" id="toggle-site-pills" checked> Radar site pills</label>
+  <label class="row"><input type="checkbox" id="toggle-mosaic"> National mosaic</label>
   <div id="status">loading...</div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
