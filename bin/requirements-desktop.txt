@@ -1,0 +1,14 @@
+# Optional: enables running Radar Lab as a standalone desktop app
+# (bin/radar_lab_app.py) instead of a headless server you point a
+# browser at. Not needed for the systemd/server deployment.
+#
+# Linux also needs a native webview backend pywebview can drive --
+# GTK3 + WebKit2GTK (`apt install python3-gi gir1.2-webkit2-4.1` on
+# Debian/Ubuntu, or the QT equivalent) or Qt with QtWebEngine.
+#
+# Windows needs the WebView2 Runtime -- built into Windows 11 by
+# default, but NOT guaranteed present on Windows 10 (verified
+# 2026-09-24, not assumed). If missing, Microsoft's WebView2 Bootstrapper
+# installs it in seconds: https://developer.microsoft.com/microsoft-edge/webview2/
+# macOS uses the OS's built-in WKWebView -- nothing extra needed there.
+pywebview

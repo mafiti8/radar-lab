@@ -1,0 +1,16 @@
+# Optional: enables the national radar mosaic feature (/api/mosaic).
+# Everything else in requirements.txt installs fine everywhere via pip;
+# radar_lab.py runs fine without this too -- it just reports the mosaic
+# as unavailable (see MOSAIC_AVAILABLE in radar_lab.py) rather than
+# failing to start.
+#
+# Linux / macOS: pip install -r requirements-mosaic.txt works directly.
+#
+# Windows: pygrib has no Windows wheels on PyPI -- install it via
+# conda-forge instead (`conda install -c conda-forge pygrib`), then this
+# file isn't needed. A pip-only Windows path (no conda) isn't available
+# yet -- researched 2026-09-24, candidates are the official `eccodes`
+# package (Windows wheels exist but the project itself calls Windows
+# support "untested") or shelling out to NOAA's prebuilt wgrib2.exe
+# instead of using a Python GRIB binding at all. Not built yet.
+pygrib

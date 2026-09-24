@@ -5,9 +5,25 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/docker/radar-lab
+# PYTHONUNBUFFERED: Python block-buffers stdout when it isn't a TTY (true
+# of a pipe to the journal) -- found live 2026-09-24 during the OOM
+# incident below, several minutes of real log lines only appeared in one
+# burst sharing a single timestamp, which is exactly what buffered writes
+# look like. Delays visibility into exactly the kind of fast-moving
+# incident these logs are for.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=%h/docker/radar-lab/.venv/bin/python %h/docker/radar-lab/bin/radar_lab.py
 Restart=on-failure
 RestartSec=5
+# Backstop, not the primary fix (see MAX_CONCURRENT_SITES in
+# radar_lab.py) -- real incident 2026-09-24: unbounded memory use let
+# this process compete with the whole system for RAM, forcing swap and
+# degrading other services (Tailscale, the portal) for hours before the
+# kernel/systemd finally killed it. A hard per-service ceiling means a
+# future bug here gets contained to killing just this cgroup quickly,
+# instead of dragging the rest of the box into swap first.
+MemoryHigh=3G
+MemoryMax=4G
 
 [Install]
 WantedBy=default.target

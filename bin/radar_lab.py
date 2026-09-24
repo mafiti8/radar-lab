@@ -20,7 +20,9 @@ client-side rendering the way single-site data works. "Server-side" here
 still just means this same process, on whatever machine runs it (today
 homehub, eventually the field laptop) -- not a separate remote service.
 """
+import ctypes
 import datetime as dt
+import gc
 import gzip
 import html
 import io
@@ -41,8 +43,21 @@ from pathlib import Path
 
 import numpy as np
 import pyart
-import pygrib
 from PIL import Image
+
+try:
+    # pygrib has no Windows wheels on PyPI (conda-forge only) -- the
+    # national mosaic feature is the one thing this app can't offer on a
+    # plain `pip install` Windows build yet. Everything else (single-site
+    # radar, all camera sources, GPS, alerts) works fine without it, so
+    # this is an optional import, not a hard dependency: the app runs
+    # fine with the mosaic feature simply reporting itself unavailable
+    # (see MOSAIC_AVAILABLE below) rather than failing to start at all.
+    import pygrib
+    MOSAIC_AVAILABLE = True
+except ImportError:
+    pygrib = None
+    MOSAIC_AVAILABLE = False
 
 BASE = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE / "web"
@@ -94,6 +109,29 @@ DBZ_STOPS = [
     (45, (0xff, 0x00, 0x00)), (50, (0xc0, 0x00, 0x00)), (55, (0xff, 0x00, 0xff)),
     (65, (0xff, 0xff, 0xff)),
 ]
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None  # non-glibc platform (e.g. musl) -- release_decode_memory() just skips the trim, harmless
+
+
+def release_decode_memory():
+    """Called after each heavy decode (Py-ART volume parse, MRMS mosaic
+    render) -- both build and discard large numpy arrays.
+    gc.collect() alone frees the *Python* objects, but real incident
+    2026-09-24: RSS kept climbing anyway, including under genuinely idle
+    single-site conditions with no user interaction driving it -- glibc's
+    malloc doesn't return freed heap pages to the OS by default, it keeps
+    them mapped for its own future reuse (documented behavior, not a
+    Python-level leak; decode_level2()'s own docstring already noted
+    glibc's allocator doesn't release promptly). malloc_trim(0) explicitly
+    asks it to release what it can back to the OS. Real fix for "gc says
+    it's garbage but RSS doesn't reflect that", not a superstitious extra
+    gc.collect()."""
+    gc.collect()
+    if _libc is not None:
+        _libc.malloc_trim(0)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +351,7 @@ class Cache:
     def __init__(self, site: str):
         self.lock = threading.Lock()
         self.site = site
+        self.last_used = time.time()  # see get_cache() -- drives idle eviction
         self.scans: dict[str, dict] = {}  # ts -> decoded level2 (tilt 0 / lowest)
         self.level3: dict[str, dict] = {}  # product -> decoded level3
         self.status = {"last_poll": None, "last_error": None}
@@ -327,28 +366,6 @@ class Cache:
         # V1 scope limit, not an oversight.
         self.latest_raw_l2: tuple[str, bytes] | None = None  # (ts, raw)
         self.tilt_cache: dict[int, dict] = {}  # tilt_index -> decoded, latest scan only
-        # National MRMS mosaic -- deliberately NOT touched by set_site()
-        # below, since it's a national product independent of whichever
-        # single NEXRAD site is currently selected.
-        self.mosaic_png: bytes | None = None
-        self.mosaic_bounds: list | None = None
-        self.mosaic_updated: str | None = None
-
-    def set_site(self, new_site: str):
-        # Switching sites: old scans/level3 data belong to the old site
-        # and would be actively misleading if left in the cache (wrong
-        # location, but still structurally valid so nothing would error
-        # -- worse than just being empty). Clear rather than keep both
-        # sites cached: matches the "single active site" design (doc
-        # §2), and avoids unbounded memory growth from every site a user
-        # ever glances at.
-        with self.lock:
-            self.site = new_site
-            self.scans = {}
-            self.level3 = {}
-            self.status = {"last_poll": None, "last_error": None}
-            self.latest_raw_l2 = None
-            self.tilt_cache = {}
 
     def add_scan(self, ts: str, data: dict, raw: bytes):
         with self.lock:
@@ -399,15 +416,29 @@ class Cache:
         with self.lock:
             return self.level3.get(product)
 
-    def set_mosaic(self, png: bytes, bounds: list):
-        with self.lock:
-            self.mosaic_png = png
-            self.mosaic_bounds = bounds
-            self.mosaic_updated = dt.datetime.now(dt.timezone.utc).isoformat()
+class MosaicCache:
+    """Separate from the per-site Cache class (2026-09-24 multi-site
+    refactor) -- the national mosaic was already deliberately independent
+    of whichever site(s) are active, so it gets its own single instance
+    rather than living awkwardly inside one arbitrary site's cache."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.png: bytes | None = None
+        self.bounds: list | None = None
+        self.updated: str | None = None
 
-    def get_mosaic(self) -> tuple[bytes | None, list | None, str | None]:
+    def set(self, png: bytes, bounds: list):
         with self.lock:
-            return self.mosaic_png, self.mosaic_bounds, self.mosaic_updated
+            self.png = png
+            self.bounds = bounds
+            self.updated = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def get(self) -> tuple[bytes | None, list | None, str | None]:
+        with self.lock:
+            return self.png, self.bounds, self.updated
+
+
+MOSAIC_CACHE = MosaicCache()
 
 
 def _parse_ts(key: str) -> dt.datetime:
@@ -416,37 +447,91 @@ def _parse_ts(key: str) -> dt.datetime:
     return dt.datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=dt.timezone.utc)
 
 
-CACHE = Cache(SITE)
-POLL_WAKE = threading.Event()  # lets a site switch skip the wait, see do_GET
+# Multi-site cache registry (2026-09-24, replaces the original
+# single-global-CACHE design) -- built so each grid panel can watch a
+# genuinely different radar site at once, not just a different
+# product/tilt of the same shared site. One Cache + one dedicated poll
+# thread per site actually in use, created lazily on first request and
+# evicted after sitting idle -- "full concurrent polling", the option
+# picked over lighter on-demand-snapshot alternatives specifically so
+# every open panel keeps getting real live updates regardless of how
+# many different sites are open across a grid, not just the first one.
+_caches: dict[str, Cache] = {}
+_caches_lock = threading.Lock()
+CACHE_IDLE_EVICT_SEC = 1800  # unused site's cache + poll thread torn down after this long
+# Real incident, 2026-09-24: with no cap here, per-panel site selection
+# (each grid panel can watch a different site) let real usage ramp up to
+# ~10 concurrently-active sites -- each one's own Py-ART decode + rolling
+# scan cache is heavy enough that this exhausted RAM, forced the box into
+# swap, and got this process OOM-killed by systemd (degrading Tailscale/
+# the portal/general reachability for the ~2 hours leading up to the
+# kill, not just radar-lab itself -- one process thrashing on swap can
+# drag down a whole small box). CACHE_IDLE_EVICT_SEC alone doesn't
+# prevent this -- 30 minutes is way too slow to stop a burst of many new
+# sites piling up in the meantime. This is the actual fix: a hard ceiling
+# on how many *different* sites can be concurrently active, oldest
+# (least-recently-used) one evicted immediately to make room for a new
+# one past that ceiling, same idea as the idle eviction just enforced
+# proactively instead of reactively.
+MAX_CONCURRENT_SITES = int(ENV.get("RADAR_LAB_MAX_SITES", "4"))  # matches the max grid layout (4 panels) -- no reason to poll more sites than there are screens to show them on
+DEFAULT_SITE = SITE  # seeds new panels and any request that omits ?site=
 
 
-def poll_loop():
+def get_cache(site: str) -> Cache:
+    site = site.upper()
+    with _caches_lock:
+        cache = _caches.get(site)
+        if cache is None:
+            if len(_caches) >= MAX_CONCURRENT_SITES:
+                lru_site = min(_caches, key=lambda s: _caches[s].last_used)
+                del _caches[lru_site]
+                print(f"[radar-lab] evicted {lru_site} (least-recently-used) to stay "
+                      f"under MAX_CONCURRENT_SITES={MAX_CONCURRENT_SITES}")
+            cache = Cache(site)
+            _caches[site] = cache
+            threading.Thread(target=poll_site_loop, args=(site, cache), daemon=True).start()
+            print(f"[radar-lab] started polling site {site}")
+        cache.last_used = time.time()
+        return cache
+
+
+def poll_site_loop(site: str, cache: Cache):
+    """One of these runs per active site (see get_cache()) -- permanently
+    bound to that one site for its whole life, unlike the original single
+    shared poll_loop that had to detect and react to a site *changing*
+    underneath it. Exits (and get_cache() will start a fresh one if the
+    site's ever requested again) once evicted -- either idle for
+    CACHE_IDLE_EVICT_SEC, or bumped by get_cache()'s LRU cap -- checked
+    once per poll cycle (at most POLL_INTERVAL_SEC lag on noticing an LRU
+    eviction, since that happens directly in get_cache(), not signaled
+    here)."""
     last_l2_key = None
     last_l3_key = {"NST": None, "NMD": None}
-    last_site = None
     while True:
-        site = CACHE.site
-        if site != last_site:
-            # Site changed since the last iteration -- Cache.set_site()
-            # already cleared the cache, but these locals also need
-            # resetting so a same-named key from a *previous* visit to
-            # this site (e.g. switching A -> B -> A) doesn't get
-            # mistaken for "already have this one, skip it".
-            last_l2_key = None
-            last_l3_key = {"NST": None, "NMD": None}
-            last_site = site
+        with _caches_lock:
+            if _caches.get(site) is not cache:
+                return  # evicted (idle timeout or LRU cap) while this thread was asleep
+            if time.time() - cache.last_used > CACHE_IDLE_EVICT_SEC:
+                del _caches[site]
+                print(f"[radar-lab] evicted idle site {site}")
+                return
 
         try:
             key = latest_level2_key(site)
             if key and key != last_l2_key:
                 raw = s3_fetch(L2_BUCKET, key)
                 decoded = decode_level2(raw, site)
-                CACHE.add_scan(key, decoded, raw)
+                cache.add_scan(key, decoded, raw)
                 last_l2_key = key
-                print(f"[radar-lab] new level2 scan: {key}")
+                print(f"[radar-lab] new level2 scan ({site}): {key}")
+                # Py-ART's own intermediate radar object (built from the
+                # full volume scan, most of which is discarded once the
+                # handful of fields FIELD_MAP actually wants are pulled
+                # out) is large and short-lived -- see release_decode_memory().
+                release_decode_memory()
         except Exception as e:  # noqa: BLE001 -- poller must never die
-            CACHE.status["last_error"] = f"level2: {e}"
-            print(f"[radar-lab] level2 poll error: {e}")
+            cache.status["last_error"] = f"level2: {e}"
+            print(f"[radar-lab] level2 poll error ({site}): {e}")
 
         for product in ("NST", "NMD"):
             try:
@@ -454,19 +539,15 @@ def poll_loop():
                 if key and key != last_l3_key[product]:
                     raw = s3_fetch(L3_BUCKET, key)
                     decoded = decode_level3(raw, site)
-                    CACHE.set_level3(product, decoded)
+                    cache.set_level3(product, decoded)
                     last_l3_key[product] = key
-                    print(f"[radar-lab] new level3 {product}: {key}")
+                    print(f"[radar-lab] new level3 {product} ({site}): {key}")
             except Exception as e:  # noqa: BLE001
-                CACHE.status["last_error"] = f"{product}: {e}"
-                print(f"[radar-lab] level3 {product} poll error: {e}")
+                cache.status["last_error"] = f"{product}: {e}"
+                print(f"[radar-lab] level3 {product} poll error ({site}): {e}")
 
-        CACHE.status["last_poll"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        # Event.wait() instead of time.sleep() so a site switch (do_GET
-        # calls POLL_WAKE.set()) fetches immediately instead of waiting
-        # up to POLL_INTERVAL_SEC for the new site's first scan.
-        POLL_WAKE.wait(POLL_INTERVAL_SEC)
-        POLL_WAKE.clear()
+        cache.status["last_poll"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        time.sleep(POLL_INTERVAL_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +625,9 @@ def decode_and_render_mosaic(raw_gz: bytes) -> tuple[bytes, list]:
 
 
 def mosaic_poll_loop():
+    if not MOSAIC_AVAILABLE:
+        print("[radar-lab] mosaic disabled -- pygrib not installed on this platform")
+        return
     last_key = None
     while True:
         try:
@@ -551,9 +635,10 @@ def mosaic_poll_loop():
             if key and key != last_key:
                 raw_gz = s3_fetch(MRMS_BUCKET, key)
                 png, bounds = decode_and_render_mosaic(raw_gz)
-                CACHE.set_mosaic(png, bounds)
+                MOSAIC_CACHE.set(png, bounds)
                 last_key = key
                 print(f"[radar-lab] new mosaic: {key} ({len(png)} bytes)")
+                release_decode_memory()  # 24.5M-point grid's intermediate arrays
         except Exception as e:  # noqa: BLE001 -- poller must never die
             print(f"[radar-lab] mosaic poll error: {e}")
         time.sleep(MOSAIC_POLL_INTERVAL_SEC)
@@ -1068,19 +1153,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        global DEFAULT_SITE
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
         path = parsed.path
 
         if path == "/api/status":
-            ts, _ = CACHE.latest_scan()
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            ts, _ = cache.latest_scan()
             self._json({
-                "site": CACHE.site, "latest_scan": ts,
-                "scan_count": len(CACHE.scan_list()), **CACHE.status,
+                "site": cache.site, "latest_scan": ts,
+                "scan_count": len(cache.scan_list()), **cache.status,
             })
 
         elif path == "/api/scans":
-            self._json({"scans": CACHE.scan_list()})
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            self._json({"scans": cache.scan_list()})
 
         elif path == "/api/sites":
             try:
@@ -1094,6 +1182,15 @@ class Handler(BaseHTTPRequestHandler):
             # existing "everything's a query param" style, and adding
             # POST-body parsing machinery for one endpoint isn't worth
             # it for a local single-user tool.
+            #
+            # This no longer means "the one active site" (2026-09-24 --
+            # every panel in a grid can watch a different site now, each
+            # with its own always-on poll thread via get_cache()). It
+            # just sets DEFAULT_SITE, the fallback used by any request
+            # that doesn't pass its own ?site= (the very first page load,
+            # before app.js has assigned any panel a specific site) --
+            # and, as a side effect, starts that site's cache warming
+            # immediately rather than waiting for the first real request.
             new_site = qs.get("set", [None])[0]
             if new_site:
                 new_site = new_site.upper()
@@ -1105,19 +1202,28 @@ class Handler(BaseHTTPRequestHandler):
                 if new_site not in valid_ids:
                     self._json({"error": f"unknown site {new_site}"}, 400)
                     return
-                CACHE.set_site(new_site)
-                POLL_WAKE.set()  # don't make the switch wait for the next poll cycle
-                print(f"[radar-lab] site switched to {new_site}")
-            self._json({"site": CACHE.site})
+                DEFAULT_SITE = new_site
+                get_cache(new_site)
+                print(f"[radar-lab] default site switched to {new_site}")
+            self._json({"site": DEFAULT_SITE})
+
+        elif path == "/api/level3/nst":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            self._json(cache.get_level3("NST") or {"points": []})
+
+        elif path == "/api/level3/nmd":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            self._json(cache.get_level3("NMD") or {"points": []})
 
         elif path.startswith("/api/") and path[5:] in FIELD_MAP:
             name = path[5:]
             _pyart_field, cache_key, resp_key = FIELD_MAP[name]
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
             ts = qs.get("ts", [None])[0]
             tilt_param = qs.get("tilt", [None])[0]
 
             if tilt_param is None:
-                data = CACHE.get_scan(ts) if ts else CACHE.latest_scan()[1]
+                data = cache.get_scan(ts) if ts else cache.latest_scan()[1]
             else:
                 # Tilt selection (2026-09-23): only supported for the
                 # current live scan, decoded on demand -- see Cache
@@ -1128,22 +1234,23 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._json({"error": "tilt must be an integer"}, 400)
                     return
-                target_ts = ts or CACHE.latest_scan()[0]
-                raw = CACHE.raw_for(target_ts) if target_ts else None
+                target_ts = ts or cache.latest_scan()[0]
+                raw = cache.raw_for(target_ts) if target_ts else None
                 if raw is None:
                     self._json({
                         "error": "tilt selection is only available for the current live scan"
                         if target_ts else "no scan cached yet"
                     }, 400 if target_ts else 503)
                     return
-                data = CACHE.get_tilt(target_ts, tilt_index)
+                data = cache.get_tilt(target_ts, tilt_index)
                 if data is None:
                     try:
-                        data = decode_level2(raw, CACHE.site, tilt_index)
+                        data = decode_level2(raw, cache.site, tilt_index)
                     except ValueError as e:
                         self._json({"error": str(e)}, 400)
                         return
-                    CACHE.set_tilt(target_ts, tilt_index, data)
+                    cache.set_tilt(target_ts, tilt_index, data)
+                    release_decode_memory()  # this is the on-demand re-decode path (see decode_level2 docstring) -- the one most exposed to real multi-panel tilt-switching load
 
             if data is None or cache_key not in data:
                 self._json({"error": f"no {name} data cached yet"}, 503)
@@ -1153,21 +1260,18 @@ class Handler(BaseHTTPRequestHandler):
                 resp_key: serialize_field(data, cache_key),
             })
 
-        elif path == "/api/level3/nst":
-            self._json(CACHE.get_level3("NST") or {"points": []})
-
-        elif path == "/api/level3/nmd":
-            self._json(CACHE.get_level3("NMD") or {"points": []})
-
         elif path == "/api/mosaic":
-            _png, bounds, updated = CACHE.get_mosaic()
+            if not MOSAIC_AVAILABLE:
+                self._json({"error": "national mosaic not available on this platform (pygrib not installed)"}, 501)
+                return
+            _png, bounds, updated = MOSAIC_CACHE.get()
             if bounds is None:
                 self._json({"error": "no mosaic rendered yet"}, 503)
                 return
             self._json({"bounds": bounds, "updated": updated})
 
         elif path == "/api/mosaic.png":
-            png, _bounds, _updated = CACHE.get_mosaic()
+            png, _bounds, _updated = MOSAIC_CACHE.get()
             if png is None:
                 self.send_error(503)
                 return
@@ -1233,7 +1337,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    threading.Thread(target=poll_loop, daemon=True).start()
+    get_cache(SITE)  # start warming the default site immediately, not on first request
     threading.Thread(target=mosaic_poll_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[radar-lab] serving on :{PORT}, site={SITE}, poll every {POLL_INTERVAL_SEC}s, "

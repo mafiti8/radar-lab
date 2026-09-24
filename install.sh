@@ -65,6 +65,12 @@ fi
 echo "Installing dependencies (numpy/scipy/Py-ART/MetPy -- can take a few minutes)..."
 .venv/bin/pip install --upgrade pip -q
 .venv/bin/pip install -r bin/requirements.txt -q
+# requirements-mosaic.txt (pygrib, for the national radar mosaic) is kept
+# separate from the base requirements because pygrib has no Windows pip
+# wheels -- but this script has already gated on Linux above, where pip
+# installs it fine, so it's still installed by default here to keep the
+# existing default Linux experience (mosaic works out of the box) intact.
+.venv/bin/pip install -r bin/requirements-mosaic.txt -q
 echo "Dependencies installed."
 echo ""
 

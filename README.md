@@ -8,11 +8,13 @@ no subscription and no account.
   with per-panel tilt selection across all of a site's real elevation
   angles — not just the lowest scan.
 - **Split-screen**: view 1, 2, or 4 panels at once, each with its own
-  product and pan/zoom — e.g. reflectivity next to velocity for the same
-  storm, or two different storm sections side by side.
+  product, tilt, pan/zoom, and — as of 2026-09-24 — its own radar site.
+  Watch two different storms in two different states at once, not just
+  two products of the same storm.
 - **Any radar site, nationwide**: switch between all 159 real WSR-88D
   stations from a dropdown, or click a labeled pin at the station's
-  actual location on the map.
+  actual location on the map — globally (every panel) from the main HUD,
+  or per-panel from that panel's own toolbar/pins.
 - **Severe weather overlays**: live NWS storm-track and mesocyclone
   detection, plus active NWS alert polygons.
 - **DOT traffic cameras**: live public traffic camera feeds (Indiana,
@@ -29,14 +31,28 @@ stays responsive without a round trip to the server for every move.
 
 ## System requirements
 
-- **OS**: Linux x86_64 only. The scientific dependency stack (Py-ART,
-  NumPy, SciPy via MetPy) ships as compiled `manylinux` wheels with no
-  ARM or Windows/macOS builds. Windows: use WSL2. macOS/ARM (Apple
-  Silicon, Raspberry Pi): not supported.
+- **OS**: built and verified on Linux x86_64. **Windows support is in
+  progress (started 2026-09-24), not yet verified end-to-end** -- Py-ART,
+  NumPy, and MetPy all install fine via plain `pip` on Windows per their
+  own docs, and the one library that didn't (`pygrib`, used only for the
+  optional national radar mosaic) is now an optional dependency --
+  `radar_lab.py` runs and serves everything else fine without it (see
+  `bin/requirements-mosaic.txt`). What hasn't happened yet: actually
+  running this on a real Windows machine. Treat "should work" as exactly
+  that until it's been tried. macOS/ARM (Apple Silicon, Raspberry Pi):
+  not investigated at all yet.
 - **Python**: 3.10 or newer.
-- **RAM**: under 1GB steady-state (measured: ~225MB base + ~45MB per
-  cached radar scan, ~13 scans in the default 90-minute rolling window).
-  No swap or special tuning needed.
+- **RAM**: under 1GB steady-state **per active radar site** (measured:
+  ~225MB base + ~45MB per cached radar scan, ~13 scans in the default
+  90-minute rolling window). Since 2026-09-24, grid mode can have each
+  panel watching a genuinely different site (see below) -- each one
+  concurrently polled/cached/decoded means memory scales roughly
+  linearly with how many *different* sites are actually open at once,
+  not a fixed cost. Measured live with 3 different sites open across a
+  grid: ~1.9GB total. Idle sites (no panel watching them anymore) are
+  evicted after 30 minutes, so this doesn't grow unbounded over a long
+  session -- but size for "however many different sites you'll realistically
+  have open in a grid at once", not the old flat single-site number.
 - **CPU**: any x86_64 CPU from roughly the last decade. Decoding a new
   volume scan takes ~2-3s, but that only happens once every 6-7 minutes
   (the real NEXRAD update cadence) — not a sustained load.
@@ -74,14 +90,39 @@ cp .env.example .env   # edit RADAR_LAB_SITE if not KVWX
 
 Then open `http://localhost:8297/`.
 
-**Platform**: Linux x86_64 only for now. The dependency stack (Py-ART,
-numpy, scipy via MetPy) ships as compiled `manylinux` wheels -- no ARM
-build, no Windows/macOS wheels. Windows users would need WSL2; macOS and
-ARM (Apple Silicon, Raspberry Pi, ARM Chromebooks) aren't supported at
-all right now. If this gets published for wider use, that's the first
-real limitation to flag for anyone outside Linux x86_64 -- worth
-deciding then whether it's worth chasing (conda-forge has ARM/macOS
-Py-ART builds, which might be an easier path than fighting pip wheels).
+**Platform**: verified on Linux x86_64. Windows support is real work in
+progress, not yet verified live -- see System requirements above.
+macOS/ARM (Apple Silicon, Raspberry Pi, ARM Chromebooks) not
+investigated yet. Worth deciding, once someone actually tries a Windows
+run, whether conda-forge (has ARM/macOS Py-ART builds too) ends up an
+easier path than chasing pip wheels per-platform.
+
+### Running as a standalone desktop app (not a browser tab)
+
+```
+.venv/bin/pip install -r bin/requirements-desktop.txt
+.venv/bin/python bin/radar_lab_app.py
+```
+
+Opens Radar Lab in a real native window (`pywebview`, wrapping the OS's
+own webview -- WebView2 on Windows, WKWebView on macOS, WebKitGTK on
+Linux) instead of a browser tab -- no address bar, no tabs, a genuine
+double-click program. Same backend as `radar_lab.py`, just bound to
+127.0.0.1 only and launched on a background thread instead of the
+headless `serve_forever()` used for the systemd/server deployment; that
+deployment path is unchanged and still the right choice for a
+box other people reach over the network (e.g. Tailscale).
+
+**Built 2026-09-24, not yet run in a real GUI environment** -- this dev
+box is a headless server with no display, so `webview.create_window()`
+and `webview.start()` have been checked against pywebview's real,
+installed API (verified live: `inspect.signature()` against the actual
+package, not guessed from memory) but never actually launched a window.
+The one non-obvious fix already made: pywebview defaults to
+`private_mode=True` (incognito), which would silently wipe `localStorage`
+-- including the night-mode toggle's persistence -- on every relaunch;
+`radar_lab_app.py` explicitly passes `private_mode=False`. Genuinely the
+next thing to verify on a real machine before trusting this.
 
 ---
 
@@ -327,6 +368,40 @@ requirement of the software itself.
   from 5 flat markers to 3 real distinct locations for the Evansville
   area, with the 3 previously-buried cameras now showing together in one
   popup.
+- **Per-panel radar sites, built 2026-09-24** (each panel's own toolbar
+  now has a site dropdown, on top of the existing product/tilt ones):
+  real architecture change, not a UI-only add. The backend used to track
+  exactly one active site globally (`CACHE`/`SITE`, one poll thread) --
+  replaced with a `get_cache(site)` registry: one `Cache` + one dedicated
+  poll thread per site actually in use, created lazily on first request,
+  evicted after 30 minutes idle. Chosen deliberately (asked, not
+  assumed) over a lighter on-demand-snapshot alternative -- every open
+  panel keeps getting real live updates regardless of how many different
+  sites are open at once, not just the first one. Verified live: KVWX,
+  KIND, KLVX all polling and decoding independently and concurrently,
+  each returning its own real lat/lon/reflectivity, no cross-contamination.
+  - **Real, documented scope limit**: the playback scrubber (`scans[]`/
+    the slider) is fetched for one site's scan list -- a panel showing a
+    *different* site than the global default has no synchronized scan
+    list of its own to scrub through, so it always shows that site's
+    live latest, ignoring the shared slider position. Same shape as the
+    existing "tilt selection only works on the live scan" limit, not an
+    oversight -- per-site playback would need per-site scan lists, a
+    bigger change than this feature asked for.
+  - **Also still shared/global, deliberately**: cameras, NWS alerts,
+    storm-track/mesocyclone (NST/NMD), GPS, and the national mosaic all
+    stay scoped to the single default site's location, not per-panel --
+    only `siteLatLon` from the default-site panel(s) drives them. The
+    ask was specifically about radar data per panel, not multiplying
+    every secondary overlay by however many sites are open.
+  - **The global "Radar site" HUD dropdown still works exactly as
+    before** -- a bulk action that resets every panel to the same site.
+    The new per-panel controls (that panel's own dropdown, or clicking a
+    site pill on that panel's own map) are an override layered on top,
+    not a replacement.
+  - **Real memory cost, not free**: see System requirements above --
+    measured ~1.9GB with 3 different sites open at once, versus the old
+    flat ~1GB single-site number.
 - **Camera images auto-refresh + fullscreen lightbox, built 2026-09-24**:
   snapshot URLs are "latest image" endpoints on the source's own server
   -- the URL string itself never changes when a new frame is captured,

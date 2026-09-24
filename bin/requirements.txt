@@ -3,5 +3,4 @@ metpy
 numpy
 requests
 gps3
-pygrib
 Pillow

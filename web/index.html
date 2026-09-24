@@ -6,7 +6,40 @@
 <title>Radar Lab</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
+  /* Theme variables, not hardcoded colors throughout, so a single class
+     on <body> reskins every UI element at once -- needed for night mode
+     (see #night-toggle below): a red, low-brightness theme meant for
+     actual use in a moving vehicle after dark, where a stray white popup
+     or a default-gray browser button is a real glare/distraction
+     problem, not just a cosmetic one. Radar/mosaic data tiles live in
+     their own Leaflet panes (radarTilePane/mosaicPane) and are
+     deliberately NOT touched by any of this -- dBZ color coding has to
+     stay true regardless of theme, only the chrome and basemap dim. */
+  :root {
+    --bg-panel: rgba(10, 14, 20, .9);
+    --bg-solid: #12161d;
+    --fg: #cbd5e1;
+    --fg-dim: #94a3b8;
+    --border: #3a3a3a;
+    --accent: #38bdf8;
+    --accent-fg: #0b0f14;
+    --tile-filter: none;
+  }
+  body.night-mode {
+    --bg-panel: rgba(15, 3, 3, .93);
+    --bg-solid: #170707;
+    --fg: #ff6b4a;
+    --fg-dim: #b3492e;
+    --border: #4a1c14;
+    --accent: #d1401f;
+    --accent-fg: #170707;
+    /* Dims + red-shifts the basemap and GOES imagery (both live in
+       Leaflet's default tilePane) so nothing on screen is anywhere near
+       full brightness -- the actual point of night mode. */
+    --tile-filter: brightness(.4) saturate(.55) sepia(.5) hue-rotate(-35deg);
+  }
   html, body { margin: 0; height: 100%; background: #0b0f14; font-family: system-ui, sans-serif; }
+  body.night-mode { background: #0a0202; }
   #grid {
     /* position:fixed (not absolute) so this is anchored straight to the
        viewport, independent of html/body's own computed height -- mobile
@@ -22,31 +55,35 @@
   #grid.layout-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
   .panel { position: relative; overflow: hidden; }
   .panel-map { position: absolute; inset: 0; }
+  .leaflet-tile-pane { filter: var(--tile-filter); transition: filter .2s ease; }
   .leaflet-div-icon.site-pill-wrap { background: transparent; border: none; }
   .site-pill {
-    display: inline-block; background: rgba(10, 14, 20, .85); color: #cbd5e1;
-    border: 1px solid #3a3a3a; border-radius: 10px; padding: 1px 6px;
+    display: inline-block; background: var(--bg-panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 10px; padding: 1px 6px;
     font-size: 11px; font-weight: 600; white-space: nowrap; cursor: pointer;
     transform: translate(-50%, -50%); /* center the pill on the site's coordinate */
   }
-  .site-pill:hover { background: rgba(30, 41, 59, .95); }
-  .site-pill.site-pill-active { background: #38bdf8; color: #0b0f14; border-color: #38bdf8; }
+  .site-pill:hover { background: var(--bg-solid); }
+  .site-pill.site-pill-active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   .panel-toolbar {
     position: absolute; top: 4px; left: 4px; z-index: 1000;
-    background: rgba(10, 14, 20, .85); border-radius: 4px; padding: 2px 4px;
+    background: var(--bg-panel); border-radius: 4px; padding: 2px 4px;
     display: flex; flex-direction: column; gap: 2px; max-width: 45%;
   }
   .panel-toolbar select { font-size: 12px; max-width: 100%; }
-  #hud-toggle {
-    position: fixed; top: 8px; right: 8px; z-index: 1100;
+  #hud-toggle, #night-toggle {
+    position: fixed; top: 8px; z-index: 1100;
     width: 38px; height: 38px; border: none; border-radius: 8px;
-    background: rgba(10, 14, 20, .9); color: #e8e8e8; font-size: 18px;
+    background: var(--bg-panel); color: var(--fg); font-size: 18px;
     line-height: 1; cursor: pointer;
   }
+  #hud-toggle { right: 8px; }
+  #night-toggle { right: 52px; }
+  #night-toggle.night-active { background: var(--accent); color: var(--accent-fg); }
   #hud {
     position: fixed; top: 8px; right: 8px; z-index: 1000;
-    background: rgba(10, 14, 20, .92); color: #cbd5e1; padding: 8px 10px;
-    padding-top: 50px; /* clears the toggle button, which sits on top of it */
+    background: var(--bg-panel); color: var(--fg); padding: 8px 10px;
+    padding-top: 50px; /* clears the toggle buttons, which sit on top of it */
     border-radius: 6px; font-size: 13px; max-width: 260px;
     max-height: calc(100% - 16px); overflow-y: auto;
     transition: transform .2s ease;
@@ -57,10 +94,34 @@
   #hud .row { display: flex; gap: 6px; align-items: center; }
   #hud .row label { display: flex; gap: 4px; align-items: center; flex: 1; margin-top: 0; }
   #status { margin-top: 6px; opacity: .7; font-size: 11px; }
+
+  /* Everything below is unstyled-by-default browser/Leaflet chrome
+     (buttons, selects, zoom control, popups, attribution) that was
+     rendering as plain white/gray boxes on top of an otherwise near-
+     black UI -- glaring regardless of night mode, so themed unconditionally
+     with the same variables rather than only under body.night-mode. */
+  button, select, input {
+    background: var(--bg-solid); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; font-family: inherit;
+  }
+  .leaflet-control-zoom a {
+    background: var(--bg-solid) !important; color: var(--fg) !important;
+    border-color: var(--border) !important;
+  }
+  .leaflet-control-zoom a:hover { background: var(--bg-panel) !important; }
+  .leaflet-control-attribution {
+    background: var(--bg-panel) !important; color: var(--fg-dim) !important;
+  }
+  .leaflet-control-attribution a { color: var(--fg) !important; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+    background: var(--bg-solid) !important; color: var(--fg) !important;
+  }
+  .leaflet-popup-close-button { color: var(--fg-dim) !important; }
 </style>
 </head>
 <body>
 <div id="grid" class="layout-1"></div>
+<button id="night-toggle" aria-label="Toggle night mode">&#9789;</button>
 <button id="hud-toggle" aria-label="Toggle menu">&#9776;</button>
 <div id="hud">
   <strong>Radar Lab</strong> <span id="site"></span>

@@ -317,7 +317,7 @@ function kmOffsetToLatLon(lat, lon, xKm, yKm) {
 // Panels
 // ---------------------------------------------------------------------
 
-function createPanel(product) {
+function createPanel(product, site) {
   const container = document.createElement("div");
   container.className = "panel";
   const mapDiv = document.createElement("div");
@@ -326,6 +326,17 @@ function createPanel(product) {
 
   const toolbar = document.createElement("div");
   toolbar.className = "panel-toolbar";
+
+  // Per-panel radar site (2026-09-24) -- lets grid mode show genuinely
+  // different sites side by side, not just different products/tilts of
+  // the same one. Defaults to whatever the global "Radar site" HUD
+  // dropdown currently shows; the HUD dropdown remains a "set all
+  // panels" bulk action (switchSite()), this is the individual override
+  // on top of it (switchPanelSite()).
+  const siteSelectEl = document.createElement("select");
+  populateSiteOptions(siteSelectEl);
+  toolbar.appendChild(siteSelectEl);
+
   const select = document.createElement("select");
   for (const [val, label] of Object.entries(PRODUCT_LABELS)) {
     const opt = document.createElement("option");
@@ -371,6 +382,8 @@ function createPanel(product) {
   const panel = {
     container,
     map,
+    site: site || currentSite || "", // backfilled in tick() if still empty once the real default is known
+    siteSelect: siteSelectEl,
     select,
     product,
     tiltSelect,
@@ -392,6 +405,9 @@ function createPanel(product) {
     siteMarkersLayer: L.layerGroup().addTo(map),
     mosaicOverlay: null, // current national-mosaic imageOverlay, if shown (see refreshMosaic)
   };
+  siteSelectEl.value = panel.site;
+
+  siteSelectEl.addEventListener("change", () => switchPanelSite(panel, siteSelectEl.value));
 
   select.addEventListener("change", () => {
     panel.product = select.value;
@@ -475,11 +491,12 @@ function setLayout(n) {
 // Radar rendering per panel
 // ---------------------------------------------------------------------
 
-async function fetchProductData(product, ts, tilt) {
-  const cacheKey = `${product}:${ts || "live"}:${tilt}`;
+async function fetchProductData(product, ts, tilt, site) {
+  const cacheKey = `${site}:${product}:${ts || "live"}:${tilt}`;
   if (scanDataCache.has(cacheKey)) return scanDataCache.get(cacheKey);
   const endpoint = PRODUCT_ENDPOINTS[product];
   const params = new URLSearchParams();
+  if (site) params.set("site", site);
   if (ts) params.set("ts", ts);
   if (tilt) params.set("tilt", tilt); // omit for tilt 0 -- keeps the fast pre-decoded path on the backend
   const qs = params.toString();
@@ -511,10 +528,24 @@ function syncTiltSelect(panel, data) {
 }
 
 async function renderPanelRadar(panel) {
-  const ts = scans[scanIndex] || null;
+  // The playback scrubber (scans[]/scanIndex) is fetched for a single
+  // site (see refreshScanList) -- a panel showing a *different* site
+  // than the default has no scan list of its own to scrub through, so
+  // it always shows that site's live latest instead of whatever
+  // timestamp the shared slider happens to be on. Real, documented V1
+  // scope limit (same shape as the tilt-selection-only-on-latest-scan
+  // limit already in place), not an oversight -- per-site playback would
+  // need per-site scan lists, a bigger change than this feature asked for.
+  const isDefaultSite = panel.site === siteSelect.value;
+  const ts = isDefaultSite ? (scans[scanIndex] || null) : null;
   try {
-    const data = await fetchProductData(panel.product, ts, panel.tilt);
-    siteLatLon = [data.lat, data.lon];
+    const data = await fetchProductData(panel.product, ts, panel.tilt, panel.site);
+    // Cameras/alerts/NST/NMD overlays are all still scoped to one shared
+    // location (see refreshLevel3, refreshCameras) -- only the
+    // default-site panel(s) get to drive that shared siteLatLon, so a
+    // panel showing a different site doesn't silently redirect those
+    // overlays to the wrong place.
+    if (isDefaultSite) siteLatLon = [data.lat, data.lon];
     syncTiltSelect(panel, data);
     const values = data[panel.product];
     if (!values) {
@@ -865,16 +896,27 @@ async function loadCameraStateOptions() {
   }
 }
 
+function populateSiteOptions(selectEl) {
+  selectEl.innerHTML = "";
+  for (const s of siteList) {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    opt.textContent = s.name ? `${s.id} — ${s.name}` : s.id;
+    selectEl.appendChild(opt);
+  }
+}
+
 async function loadSiteList() {
   try {
     const { sites } = await fetchJSON("/api/sites");
     siteList = sites;
-    siteSelect.innerHTML = "";
-    for (const s of sites) {
-      const opt = document.createElement("option");
-      opt.value = s.id;
-      opt.textContent = s.name ? `${s.id} — ${s.name}` : s.id;
-      siteSelect.appendChild(opt);
+    populateSiteOptions(siteSelect);
+    // Panels created before this resolved (the very first panel, at
+    // boot) got an empty site dropdown -- fill those in now that real
+    // options exist, preserving whatever site each panel already has.
+    for (const p of panels) {
+      populateSiteOptions(p.siteSelect);
+      p.siteSelect.value = p.site;
     }
     refreshSitePills();
   } catch (e) {
@@ -884,10 +926,15 @@ async function loadSiteList() {
 
 // Each site is a real map marker at its actual coordinates, styled as a
 // small clickable "pill" (L.divIcon, not a plain dot) showing the
-// station ID -- clicking one switches to that radar, same switchSite()
-// the dropdown uses. Redrawn (not just toggled) whenever the panel set
-// changes or the active site changes, since divIcons can't be restyled
-// in place without rebuilding them.
+// station ID -- clicking one switches *that panel's own map* to that
+// radar (switchPanelSite(), 2026-09-24 -- previously always the global
+// switchSite(), before panels could show different sites at all).
+// Highlighted pill is per-panel too now (that panel's own site), not
+// always the global default -- otherwise a grid panel deliberately
+// showing a non-default site would misleadingly highlight some other
+// site's pill on its own map. Redrawn (not just toggled) whenever the
+// panel set changes or any panel's active site changes, since divIcons
+// can't be restyled in place without rebuilding them.
 function refreshSitePills() {
   const on = document.getElementById("toggle-site-pills").checked;
   for (const p of panels) {
@@ -911,12 +958,12 @@ function refreshSitePills() {
       // two different ones fighting each other.
       const icon = L.divIcon({
         className: "site-pill-wrap",
-        html: `<span class="site-pill${s.id === currentSite ? " site-pill-active" : ""}">${s.id}</span>`,
+        html: `<span class="site-pill${s.id === p.site ? " site-pill-active" : ""}">${s.id}</span>`,
         iconSize: [1, 1],
         iconAnchor: [0, 0],
       });
       L.marker([s.lat, s.lon], { icon, interactive: true })
-        .on("click", () => switchSite(s.id))
+        .on("click", () => switchPanelSite(p, s.id))
         .addTo(p.siteMarkersLayer);
     }
   }
@@ -971,6 +1018,12 @@ async function refreshMosaic() {
 }
 
 async function switchSite(newSite) {
+  // The global HUD "Radar site" dropdown is a bulk action -- sets every
+  // panel to this site, same as it always has. Per-panel overrides
+  // (switchPanelSite(), each panel's own toolbar dropdown / clicking a
+  // site pill on that panel's own map) are layered on top of this, not
+  // a replacement for it -- picking a new default here still resets
+  // every panel back to following it.
   try {
     await fetchJSON(`/api/site?set=${encodeURIComponent(newSite)}`);
   } catch (e) {
@@ -988,10 +1041,13 @@ async function switchSite(newSite) {
   scanIndex = -1;
   siteLatLon = null;
   for (const p of panels) {
+    p.site = newSite;
+    p.siteSelect.value = newSite;
     p.hasAutoFit = false; // let the new site's first scan re-frame the view
     p.tilt = 0; // a different site/VCP may not even have the same tilt count
     if (p.radarTileLayer) { p.map.removeLayer(p.radarTileLayer); p.radarTileLayer = null; }
   }
+  refreshSitePills();
 
   // Real measured latency: the backend needs ~8-10s to fetch + decode
   // the new site's first scan after a switch (S3 fetch + Py-ART decode,
@@ -1012,6 +1068,31 @@ async function switchSite(newSite) {
 
 siteSelect.addEventListener("change", (e) => switchSite(e.target.value));
 
+// Per-panel override (2026-09-24) -- lets one grid panel watch a
+// different site than the rest without touching any of them. Deliberately
+// narrower than switchSite(): only this one panel's state resets, and it
+// never touches the shared scanDataCache/scans/siteLatLon globals those
+// belong to the default site's playback timeline and the
+// cameras/alerts/NST/NMD overlays, which stay scoped to the default site
+// -- see renderPanelRadar's isDefaultSite comment for why.
+async function switchPanelSite(panel, newSite) {
+  panel.site = newSite;
+  panel.siteSelect.value = newSite; // keep the dropdown in sync when the change came from clicking a pill instead
+  panel.hasAutoFit = false;
+  panel.tilt = 0; // a different site/VCP may not even have the same tilt count -- syncTiltSelect() rebuilds the option list once real data comes back
+  if (panel.radarTileLayer) { panel.map.removeLayer(panel.radarTileLayer); panel.radarTileLayer = null; }
+  refreshSitePills();
+
+  setStatus(`panel: waiting for first scan from ${newSite}...`);
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    const status = await fetchJSON(`/api/status?site=${encodeURIComponent(newSite)}`).catch(() => null);
+    if (status && status.scan_count > 0) break;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  await renderPanelRadar(panel);
+}
+
 // ---------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------
@@ -1023,7 +1104,17 @@ async function tick() {
     if (siteSelect.value !== status.site) siteSelect.value = status.site;
     if (currentSite !== status.site) {
       currentSite = status.site;
-      refreshSitePills(); // re-highlight which pill is active
+      // Panels created before the real default site was known (the very
+      // first panel, at boot, before this first tick()) started with an
+      // empty panel.site -- backfill those now, without disturbing any
+      // panel that's already been given an explicit site of its own.
+      for (const p of panels) {
+        if (!p.site) {
+          p.site = status.site;
+          p.siteSelect.value = status.site;
+        }
+      }
+      refreshSitePills(); // re-highlight which pill is active on each panel
     }
     await refreshScanList();
     if (!playing) renderAllPanels();
@@ -1061,6 +1152,25 @@ setHudCollapsed(window.innerWidth < 700);
 window.addEventListener("resize", () => {
   if (window.innerWidth >= 700) setHudCollapsed(false);
 });
+
+// Night mode -- red, low-brightness theme for actual use in a moving
+// vehicle after dark (a stray white popup or default-gray button is a
+// real glare/distraction problem there, not just cosmetic). One
+// always-visible button rather than a checkbox buried in the
+// collapsible HUD, since this is the one setting someone might need to
+// flip *while driving*, not while parked reading a menu. Persisted so
+// a power-cycle (the real-world case: a vehicle-mounted device) doesn't
+// reset back to a blinding-bright screen at night.
+const nightToggle = document.getElementById("night-toggle");
+function setNightMode(on) {
+  document.body.classList.toggle("night-mode", on);
+  nightToggle.classList.toggle("night-active", on);
+  localStorage.setItem("radarLabNightMode", on ? "1" : "0");
+}
+nightToggle.addEventListener("click", () => {
+  setNightMode(!document.body.classList.contains("night-mode"));
+});
+setNightMode(localStorage.getItem("radarLabNightMode") === "1");
 
 setLayout(1);
 loadCameraStateOptions();
