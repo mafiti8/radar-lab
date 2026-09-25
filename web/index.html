@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Radar Lab</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
   /* Theme variables, not hardcoded colors throughout, so a single class
      on <body> reskins every UI element at once -- needed for night mode
@@ -57,6 +58,18 @@
   .panel-map { position: absolute; inset: 0; }
   .leaflet-tile-pane { filter: var(--tile-filter); transition: filter .2s ease; }
   .leaflet-div-icon.site-pill-wrap { background: transparent; border: none; }
+  .leaflet-div-icon.snowplow-icon-wrap { background: transparent; border: none; }
+  .snowplow-icon {
+    display: inline-block; font-size: 18px; line-height: 1; color: #f59e0b;
+    text-shadow: 0 0 2px #000, 0 0 2px #000, 0 0 2px #000;
+  }
+  .leaflet-div-icon.obs-icon-wrap { background: transparent; border: none; }
+  .obs-icon {
+    display: inline-block; background: var(--bg-panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 10px; padding: 1px 5px;
+    font-size: 11px; font-weight: 600; white-space: nowrap;
+    transform: translate(-50%, -50%);
+  }
   .site-pill {
     display: inline-block; background: var(--bg-panel); color: var(--fg);
     border: 1px solid var(--border); border-radius: 10px; padding: 1px 6px;
@@ -109,6 +122,16 @@
     border-color: var(--border) !important;
   }
   .leaflet-control-zoom a:hover { background: var(--bg-panel) !important; }
+  /* leaflet-draw's toolbar icons are a sprite image, not drawn in CSS --
+     recoloring background-color alone would leave the icon glyphs
+     themselves unchanged (dark icon, now on an equally-dark background,
+     invisible). Inverting the whole toolbar is the standard trick for
+     this: flips background+icon together into a light-icon-on-dark
+     combo without needing to know the sprite's actual colors. */
+  .leaflet-draw-toolbar { filter: invert(0.85) hue-rotate(180deg); }
+  .leaflet-draw-actions a { background: var(--bg-solid) !important; color: var(--fg) !important; }
+  .leaflet-draw-tooltip { background: var(--bg-solid); color: var(--fg); }
+  .leaflet-draw-tooltip:before { border-right-color: var(--bg-solid); }
   .leaflet-control-attribution {
     background: var(--bg-panel) !important; color: var(--fg-dim) !important;
   }
@@ -125,7 +148,7 @@
 <button id="hud-toggle" aria-label="Toggle menu">&#9776;</button>
 <div id="hud">
   <strong>Radar Lab</strong> <span id="site"></span>
-  <label>Radar site
+  <label>Radar site (all panels)
     <select id="site-select"><option value="">loading...</option></select>
   </label>
   <label>Layout
@@ -143,12 +166,21 @@
       <option value="satellite">Satellite</option>
     </select>
   </label>
+  <label>Satellite
+    <select id="goes-satellite">
+      <option value="east">GOES-East (75°W)</option>
+      <option value="west">GOES-West (137°W)</option>
+    </select>
+  </label>
   <label>GOES cloud imagery
     <select id="goes-layer">
       <option value="off">Off</option>
       <option value="ir">IR (day/night)</option>
       <option value="visible">Visible (day only)</option>
       <option value="geocolor">GeoColor</option>
+      <option value="airmass">Air Mass</option>
+      <option value="dust">Dust</option>
+      <option value="firetemp">Fire Temperature</option>
     </select>
   </label>
   <label>Playback <span id="ts-label"></span>
@@ -168,9 +200,29 @@
   <label class="row"><input type="checkbox" id="toggle-nmd" checked> Mesocyclone (NMD)</label>
   <label class="row"><input type="checkbox" id="toggle-site-pills" checked> Radar site pills</label>
   <label class="row"><input type="checkbox" id="toggle-mosaic"> National mosaic</label>
+  <label class="row"><input type="checkbox" id="toggle-lightning" checked> Lightning (GOES-East + West)</label>
+  <label class="row"><input type="checkbox" id="toggle-snowplows" checked> Snowplow trucks (Iowa)</label>
+  <label class="row"><input type="checkbox" id="toggle-obs"> Surface obs (MADIS)</label>
+  <hr>
+  <strong>Markers &amp; shapes</strong>
+  <div style="font-size:11px;opacity:.7;margin-top:2px">
+    Use the draw tools on the map (top-left of the active panel) to drop
+    pins or draw shapes. Auto-saved to disk on the server as you go --
+    nothing here survives a page reload.
+  </div>
+  <div class="row" style="margin-top:6px">
+    <button id="download-marks-csv">Pins (CSV)</button>
+    <button id="download-marks-kml">All (KML)</button>
+  </div>
+  <button id="clear-marks" style="margin-top:4px">Clear all pins/shapes</button>
   <div id="status">loading...</div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<!-- Texas camera streams are HLS (.m3u8) -- most browsers need hls.js to
+     play that; Safari/iOS have native support and skip it (see
+     attachHlsVideo in app.js). Not used by any other state's cameras. -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

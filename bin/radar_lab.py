@@ -20,6 +20,7 @@ client-side rendering the way single-site data works. "Server-side" here
 still just means this same process, on whatever machine runs it (today
 homehub, eventually the field laptop) -- not a separate remote service.
 """
+import csv
 import ctypes
 import datetime as dt
 import gc
@@ -59,8 +60,26 @@ except ImportError:
     pygrib = None
     MOSAIC_AVAILABLE = False
 
+try:
+    # Unlike pygrib, netCDF4 has real Windows wheels (verified 2026-09-24,
+    # not assumed) -- still a guarded import for the same defensive reason
+    # as MOSAIC_AVAILABLE though: no single feature should be able to take
+    # the whole app down just because one optional decode library is
+    # missing or broken on some platform.
+    import netCDF4
+    LIGHTNING_AVAILABLE = True
+except ImportError:
+    netCDF4 = None
+    LIGHTNING_AVAILABLE = False
+
 BASE = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE / "web"
+# User-drawn pins/shapes auto-save here (2026-09-24) -- deliberately NOT
+# restored into the live map on reload (the ask was "session only"), but
+# each session's work still lands on disk as its own timestamped file
+# rather than being lost when the tab closes.
+EXPORTS_DIR = BASE / "exports"
+EXPORTS_DIR.mkdir(exist_ok=True)
 
 
 def load_env() -> dict:
@@ -645,6 +664,348 @@ def mosaic_poll_loop():
 
 
 # ---------------------------------------------------------------------------
+# Lightning (GOES GLM), built 2026-09-24, both satellites added same day --
+# another national product independent of whichever NEXRAD site is
+# selected, same shape as the MRMS mosaic above. Real, free, near-real-time
+# (~17-60s latency, verified live) on AWS S3, no auth needed -- same access
+# pattern as everything else in this app. Flash-level data only (lat/lon/
+# energy per flash) -- GLM files also carry event- and group-level data
+# (individual sensor-pixel detections that get grouped into flashes) but
+# that's finer detail than a map overlay needs; flash_lat/flash_lon/
+# flash_energy are already top-level arrays in the file, no event/group
+# reconstruction (what glmtools is for) required for this.
+#
+# Both GOES-East (GOES-19, bucket noaa-goes19) and GOES-West (GOES-18,
+# bucket noaa-goes18) are identical instruments on different satellites --
+# confirmed live 2026-09-24 that GOES-West's own bucket, file format, and
+# ~20s cadence exactly mirror the East side, and that it already sees real
+# flashes as far east as Arizona/New Mexico. East alone has degraded
+# sensitivity toward the western edge of its field of view (not zero
+# coverage, just worse) -- West fills that in from a much better angle.
+# No deduplication between the two near where their coverage overlaps --
+# each satellite reports its own independent flash_id and slightly
+# different lat/lon (parallax from two different viewing angles on the
+# same real storm), so a handful of boundary-region flashes may render as
+# two nearby markers instead of one. Accepted as a minor cosmetic
+# simplification, not fixed here -- matching flashes across satellites
+# would need real geometric reasoning, not a simple id/coordinate match.
+# ---------------------------------------------------------------------------
+
+GLM_PRODUCT_PREFIX = "GLM-L2-LCFA"
+GLM_SATELLITES = {
+    "east": {"bucket": "https://noaa-goes19.s3.amazonaws.com", "label": "GOES-East"},
+    "west": {"bucket": "https://noaa-goes18.s3.amazonaws.com", "label": "GOES-West"},
+}
+GLM_POLL_INTERVAL_SEC = int(ENV.get("RADAR_LAB_LIGHTNING_POLL_INTERVAL_SEC", "20"))
+GLM_WINDOW_MINUTES = int(ENV.get("RADAR_LAB_LIGHTNING_WINDOW_MINUTES", "5"))
+# Was 15 -- real usage 2026-09-24 found that far too generous: an active
+# storm produces enough flashes (~1,700 accumulated in just 4 real
+# minutes, measured live) that 15 minutes' worth turns into thousands of
+# markers on screen, unreadable. Expiry/fade were both already working
+# correctly (verified live -- nothing older than the window was ever
+# retained); the window itself was just longer than useful.
+# Generous CONUS + margin -- GLM's real coverage is the full disk
+# (includes South America, the Atlantic, etc.), almost all irrelevant to
+# a US radar tool. Filtering server-side keeps this shippable as raw
+# JSON for the browser to draw, the same client-side-rendering approach
+# used everywhere else in this app (the mosaic above is the one
+# deliberate exception, and this isn't large enough to need to join it).
+GLM_LAT_RANGE = (18.0, 55.0)
+GLM_LON_RANGE = (-130.0, -60.0)
+
+
+def latest_glm_key(bucket: str) -> str | None:
+    now = dt.datetime.now(dt.timezone.utc)
+    for hours_back in (0, 1):  # roll back an hour near the top of the hour, same pattern as latest_level2_key's day rollback
+        t = now - dt.timedelta(hours=hours_back)
+        prefix = f"{GLM_PRODUCT_PREFIX}/{t:%Y}/{t:%j}/{t:%H}/"
+        keys = s3_list(bucket, prefix, 1000)
+        if keys:
+            return sorted(keys)[-1]
+    return None
+
+
+def decode_glm_flashes(raw: bytes, satellite_label: str) -> list[dict]:
+    with tempfile.NamedTemporaryFile(suffix=".nc") as f:
+        f.write(raw)
+        f.flush()
+        ds = netCDF4.Dataset(f.name)
+        try:
+            # netCDF4 auto-applies each variable's scale_factor/add_offset
+            # (confirmed live 2026-09-24 against a real file) -- these come
+            # back as real physical values already, not raw stored ints.
+            lats = ds.variables["flash_lat"][:]
+            lons = ds.variables["flash_lon"][:]
+            energies = ds.variables["flash_energy"][:]
+        finally:
+            ds.close()
+
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    out = []
+    for lat, lon, energy in zip(lats, lons, energies):
+        lat, lon = float(lat), float(lon)
+        if not (GLM_LAT_RANGE[0] <= lat <= GLM_LAT_RANGE[1] and GLM_LON_RANGE[0] <= lon <= GLM_LON_RANGE[1]):
+            continue
+        out.append({"lat": lat, "lon": lon, "energy_j": float(energy), "time": now_iso, "satellite": satellite_label})
+    return out
+
+
+class LightningCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.flashes: list[dict] = []
+
+    def add(self, new_flashes: list[dict]):
+        with self.lock:
+            self.flashes.extend(new_flashes)
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=GLM_WINDOW_MINUTES)
+            self.flashes = [f for f in self.flashes if dt.datetime.fromisoformat(f["time"]) > cutoff]
+
+    def get(self) -> list[dict]:
+        with self.lock:
+            return list(self.flashes)
+
+
+LIGHTNING_CACHE = LightningCache()
+
+
+def lightning_poll_loop():
+    if not LIGHTNING_AVAILABLE:
+        print("[radar-lab] lightning disabled -- netCDF4 not installed on this platform")
+        return
+    last_keys = {sat_key: None for sat_key in GLM_SATELLITES}
+    while True:
+        # One thread, both satellites polled in sequence each cycle --
+        # each fetch is small (~500KB) and sub-second, not worth a second
+        # thread for. Independent last_key per satellite so one being
+        # slow/erroring doesn't affect the other.
+        for sat_key, sat in GLM_SATELLITES.items():
+            try:
+                key = latest_glm_key(sat["bucket"])
+                if key and key != last_keys[sat_key]:
+                    raw = s3_fetch(sat["bucket"], key)
+                    flashes = decode_glm_flashes(raw, sat["label"])
+                    LIGHTNING_CACHE.add(flashes)
+                    last_keys[sat_key] = key
+                    print(f"[radar-lab] new lightning data ({sat['label']}): {key} ({len(flashes)} flashes in range)")
+                    release_decode_memory()
+            except Exception as e:  # noqa: BLE001 -- poller must never die
+                print(f"[radar-lab] lightning poll error ({sat['label']}): {e}")
+        time.sleep(GLM_POLL_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# Live snowplow truck tracking, built 2026-09-25 -- real-time position, not
+# the periodic dashcam photos (separate feature entirely, see
+# fetch_ia_snowplow_images-style code was never built since this live-
+# position feed turned out to exist too). Found while researching the
+# photo feed: its publisher's org name literally uses "AVL" (Automatic
+# Vehicle Location) already, which turned out to be a real hint -- the
+# same org (IowaDOT_SODA on ArcGIS) also publishes a genuinely rich live
+# truck feed: position, heading, speed, road/air temperature, and even
+# material spread rates (salt/brine) and individual plow blade states
+# (front/wing/underbelly). Public ArcGIS FeatureServer, no auth, same
+# access pattern as everything else here.
+#
+# Iowa only -- Nebraska and Minnesota (same org, same photo-feed pattern)
+# were checked and only publish the photo feed, not live position.
+# Indiana's own TrafficWise system (what prompted this) is not published
+# as open data anywhere found -- it's the same kind of JS SPA VA/TX
+# turned out to be, a separate not-yet-done investigation.
+#
+# Real limitation, not a bug: only trucks currently moving >3mph show up
+# at all (an intentional filter on the source's side -- a parked/idle
+# truck isn't "active"), and the feed is genuinely empty outside real
+# winter operations -- confirmed live 2026-09-25 (September, no active
+# plowing) that the query executes correctly and returns a valid empty
+# result, not an error. Could not visually verify real truck data with
+# an actual live truck this session for exactly that reason -- worth
+# checking again once real snow operations are happening.
+IA_SNOWPLOW_URL = "https://services.arcgis.com/8lRhdTsQyJpO52F1/arcgis/rest/services/AVL_Direct_View/FeatureServer/0/query"
+SNOWPLOW_POLL_INTERVAL_SEC = int(ENV.get("RADAR_LAB_SNOWPLOW_POLL_INTERVAL_SEC", "60"))  # source itself updates every ~2min
+
+
+def fetch_ia_snowplows() -> list[dict]:
+    params = urllib.parse.urlencode({
+        "where": "1=1",
+        "outFields": "LABEL,VELOCITY,HEADING,ROADTEMP,AIRTEMP,ROUTE_NAME,LOGDT,ACTIVE_MATERIAL",
+        "outSR": "4326",
+        "f": "json",
+    })
+    req = urllib.request.Request(
+        f"{IA_SNOWPLOW_URL}?{params}",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry")
+        if not geom:
+            continue
+        out.append({
+            "id": f"IA-{attrs.get('LABEL')}",
+            "label": attrs.get("LABEL"),
+            "src": "IA",
+            "lat": geom["y"],
+            "lon": geom["x"],
+            "heading_deg": attrs.get("HEADING"),
+            "speed_mph": attrs.get("VELOCITY"),
+            "road_temp_f": attrs.get("ROADTEMP"),
+            "air_temp_f": attrs.get("AIRTEMP"),
+            "route": attrs.get("ROUTE_NAME"),
+            "material": attrs.get("ACTIVE_MATERIAL"),
+            "updated": attrs.get("LOGDT"),
+        })
+    return out
+
+
+class SnowplowCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.trucks: list[dict] = []
+        self.updated: str | None = None
+
+    def set(self, trucks: list[dict]):
+        with self.lock:
+            self.trucks = trucks
+            self.updated = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def get(self) -> tuple[list[dict], str | None]:
+        with self.lock:
+            return list(self.trucks), self.updated
+
+
+SNOWPLOW_CACHE = SnowplowCache()
+
+
+def snowplow_poll_loop():
+    while True:
+        try:
+            trucks = fetch_ia_snowplows()
+            SNOWPLOW_CACHE.set(trucks)
+            if trucks:
+                print(f"[radar-lab] snowplows: {len(trucks)} active trucks (IA)")
+        except Exception as e:  # noqa: BLE001 -- poller must never die
+            print(f"[radar-lab] snowplow poll error: {e}")
+        time.sleep(SNOWPLOW_POLL_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# MADIS surface weather observations, built 2026-09-25 -- real-time
+# station data (temp/dewpoint/humidity/wind/pressure), not radar. Public,
+# no-auth "guest" access confirmed live -- took real trial and error to
+# find: the actual query needs ~15 form parameters, and several
+# reasonable-looking guesses (stasel="Y", rdr="metar") were flat wrong --
+# only found the true defaults by reading the guest page's own HTML form
+# source line by line (stasel is really a hidden field defaulting to "0",
+# rdr is cleared to "" by the page's own submit handler, varsel=2 selects
+# a real preset of 7 standard variables instead of picking them
+# individually). Verified live against a real Midwest bounding box: 729
+# distinct stations, 4,677 observations, spanning real, different
+# networks (ASOS airport stations, RAWS fire-weather stations, MesoWest,
+# citizen stations via APRSWXNET, marine/tide stations, and more) -- this
+# is genuinely what MADIS is for, a real aggregator, not a single network.
+#
+# Scoped near the active radar site (asked for over a state picker) --
+# same bounding-box-around-a-point shape as the near-site camera mode,
+# just computed server-side and passed straight to MADIS's own bbox
+# query mode (dfltrsel=1) instead of over-fetching then filtering.
+MADIS_BASE_URL = "https://madis-data.ncep.noaa.gov/madisPublic1/cgi-bin/madisXmlPublicDir"
+MADIS_CACHE_SEC = 300  # most MADIS station networks report every 5-60min -- no point refetching faster than that
+
+
+def _k_to_f(k: float) -> float:
+    return (k - 273.15) * 9 / 5 + 32
+
+
+def _mps_to_mph(mps: float) -> float:
+    return mps * 2.23694
+
+
+def _pa_to_inhg(pa: float) -> float:
+    return pa / 3386.39
+
+
+# MADIS's "var" attribute -> (our field name, unit-conversion function).
+# All 7 are what varsel=2 ("standard surface variables") actually returns
+# -- confirmed against a real response, not guessed from the form's
+# label text alone.
+MADIS_VAR_MAP = {
+    "V-T": ("temp_f", _k_to_f),
+    "V-TD": ("dewpoint_f", _k_to_f),
+    "V-RH": ("humidity_pct", lambda v: v),
+    "V-DD": ("wind_dir_deg", lambda v: v),
+    "V-FF": ("wind_speed_mph", _mps_to_mph),
+    "V-FFGUST": ("wind_gust_mph", _mps_to_mph),
+    "V-ALTSE": ("pressure_inhg", _pa_to_inhg),
+}
+
+
+def bbox_from_radius(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
+    """Returns (south, west, north, east) -- same flat-local-plane
+    approximation already used elsewhere in this app (e.g. the hazcam
+    ring offsets), fine at these distances."""
+    dlat = radius_km / 111.32
+    dlon = radius_km / (111.32 * math.cos(math.radians(lat)))
+    return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
+
+
+def fetch_madis_obs(lat: float, lon: float, radius_km: float) -> list[dict]:
+    south, west, north, east = bbox_from_radius(lat, lon, radius_km)
+    params = {
+        "time": "0", "minbck": "-59", "minfwd": "0", "recwin": "3", "timefilter": "0",
+        "dfltrsel": "1", "latll": f"{south:.4f}", "lonll": f"{west:.4f}",
+        "latur": f"{north:.4f}", "lonur": f"{east:.4f}",
+        "stanam": "", "stasel": "0", "pvdrsel": "0", "varsel": "2",
+        "qctype": "0", "qcsel": "1", "xml": "1", "csvmiss": "0", "rdr": "",
+    }
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{MADIS_BASE_URL}?{qs}", headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        xml_text = resp.read().decode("utf-8", errors="replace")
+
+    root = ET.fromstring(xml_text)
+    stations: dict[str, dict] = {}
+    for rec in root.findall("record"):
+        mapping = MADIS_VAR_MAP.get(rec.get("var"))
+        if not mapping:
+            continue
+        key, convert = mapping
+        try:
+            raw_value = float(rec.get("data_value"))
+        except (TypeError, ValueError):
+            continue
+        if raw_value <= -99998:  # MADIS's own missing-value sentinel (-99999), confirmed against a real response
+            continue
+        staid = rec.get("shef_id")
+        station = stations.setdefault(staid, {
+            "id": staid,
+            "lat": float(rec.get("lat")),
+            "lon": float(rec.get("lon")),
+            "provider": rec.get("provider"),
+            "updated": rec.get("ObTime"),
+        })
+        station[key] = round(convert(raw_value), 1)
+    return list(stations.values())
+
+
+_madis_cache: dict[tuple, dict] = {}  # (rounded lat, rounded lon, radius_km) -> {"data": [...], "ts": float}
+
+
+def get_madis_obs(lat: float, lon: float, radius_km: float) -> list[dict]:
+    key = (round(lat, 2), round(lon, 2), radius_km)
+    now = time.time()
+    cached = _madis_cache.get(key)
+    if cached and now - cached["ts"] < MADIS_CACHE_SEC:
+        return cached["data"]
+    data = fetch_madis_obs(lat, lon, radius_km)
+    _madis_cache[key] = {"data": data, "ts": now}
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Camera feeds -- verified live 2026-09-22 (see design doc §3). Fetched
 # on demand and cached briefly rather than polled continuously; these
 # aren't the core scan cadence and don't need it.
@@ -718,29 +1079,42 @@ def group_cameras_by_location(cams: list[dict]) -> list[dict]:
     to be buried underneath. Group by rounded location (~11m, well under
     real-world spacing between genuinely distinct camera sites) into one
     marker per physical location with a list of snapshot images instead
-    of one marker per camera record."""
+    of one marker per camera record.
+
+    "snapshot" (static image, most states) and "stream" (HLS video, TX --
+    see fetch_tx_cameras) are mutually exclusive per input camera, not
+    per group -- a group could in principle mix both if two different
+    real cameras happened to share a location across two different
+    sources, though that's not expected to actually happen given each
+    state's cameras all come from one source. Only non-empty lists make
+    it into the output dict, so a plain-snapshot state's grouped cameras
+    still have no "streams" key at all rather than an always-empty one."""
     groups: dict[tuple, dict] = {}
     for cam in cams:
         key = (round(cam["lat"], 4), round(cam["lon"], 4))
         group = groups.setdefault(key, {
             "id": cam["id"], "names": [], "src": cam["src"],
-            "lat": cam["lat"], "lon": cam["lon"], "snapshots": [],
+            "lat": cam["lat"], "lon": cam["lon"], "snapshots": [], "streams": [],
         })
         label = cam.get("name") or cam["id"]
         if label not in group["names"]:
             group["names"].append(label)
-        group["snapshots"].append(cam["snapshot"])
-    return [
-        {
-            "id": g["id"],
-            "name": " / ".join(g["names"]),
-            "src": g["src"],
-            "lat": g["lat"],
-            "lon": g["lon"],
-            "snapshots": g["snapshots"],
+        if cam.get("snapshot"):
+            group["snapshots"].append(cam["snapshot"])
+        if cam.get("stream"):
+            group["streams"].append(cam["stream"])
+    out = []
+    for g in groups.values():
+        entry = {
+            "id": g["id"], "name": " / ".join(g["names"]), "src": g["src"],
+            "lat": g["lat"], "lon": g["lon"],
         }
-        for g in groups.values()
-    ]
+        if g["snapshots"]:
+            entry["snapshots"] = g["snapshots"]
+        if g["streams"]:
+            entry["streams"] = g["streams"]
+        out.append(entry)
+    return out
 
 
 def parse_wkt_point(wkt: str) -> tuple[float, float] | None:
@@ -937,6 +1311,203 @@ def fetch_iteris_cameras(url: str, state_code: str) -> list[dict]:
     return out
 
 
+# Virginia runs a third distinct platform (its own "iLog" camera system,
+# not DataTables or Iteris) -- found 2026-09-24 by chasing the real
+# client-side API call through VDOT's Angular app rather than guessing:
+# the SPA's own index.html only serves itself for every path (no
+# same-origin REST API discoverable by probing common paths), and the
+# main JS bundle references NODE_ENDPOINT.foo as a *relative* path
+# (/services/511) with the actual getCamerasArray() call living in one
+# of 46 separately-loaded lazy chunk files, not the main bundle -- had to
+# download and grep all 46 to find `BASE_URL+"/array/cameras"`. Turned
+# out to be same-origin after all (511.vdot.virginia.gov itself proxies
+# it), just not at any guessable path. Verified live: 1,683 real
+# cameras, real snapshot.vdotcameras.com thumbnail confirmed as an
+# actual 200 image/png after its own redirect.
+VA_CAMERAS_URL = "https://511.vdot.virginia.gov/services/511/map/array/cameras"
+
+
+def fetch_va_cameras() -> list[dict]:
+    req = urllib.request.Request(VA_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("data", []):
+        props = feat.get("properties", {})
+        geom = feat.get("geometry", {})
+        coords = geom.get("coordinates")
+        image_url = props.get("image_url")
+        if not coords or not image_url:
+            continue
+        lon, lat = coords[0], coords[1]
+        name = props.get("description") or f"Camera {props.get('id')}"
+        out.append({
+            "id": f"VA-{props.get('id')}",
+            "name": name,
+            "src": props.get("jurisdiction") or "VA",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# Mississippi is a fourth distinct platform again -- an older-style
+# ASP.NET WebForms site (not a modern SPA), found via its classic
+# ScriptManager "PageMethods" AJAX pattern: the page's own inline script
+# lists LoadCameraData as a callable server method, invoked by POSTing an
+# empty JSON body to <page>/LoadCameraData and reading the ASP.NET AJAX
+# convention's {"d": [...]} wrapper. That one request gives real
+# coordinates for all 456 cameras (verified live), but NOT an image URL
+# -- each entry only carries an iframe src pointing at a per-camera
+# "bubble" page (mapbubbles/camerasite.aspx?site=N), and the real
+# snapshot URL only appears inside *that* page's own <img> tag. No bulk
+# endpoint for it was found, so getting real images means fetching all
+# 456 bubble pages individually -- parallelized (same
+# ThreadPoolExecutor(max_workers=10) pattern as the DataTables states'
+# pagination) rather than one request each sequentially, since this is
+# real, unavoidable API shape here, not a design choice.
+MS_CAMERA_LIST_URL = "https://www.mdottraffic.com/Default.aspx/LoadCameraData"
+MS_CAMERA_BUBBLE_URL = "https://www.mdottraffic.com/mapbubbles/camerasite.aspx?site={site}"
+_MS_SITE_ID_RE = re.compile(r"site=(\d+)")
+_MS_IMG_SRC_RE = re.compile(r"id=\"camimg\"[^>]*src='([^']+)'")
+
+
+def _fetch_ms_camera_image(site_id: str) -> str | None:
+    req = urllib.request.Request(
+        MS_CAMERA_BUBBLE_URL.format(site=site_id),
+        headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html_body = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    m = _MS_IMG_SRC_RE.search(html_body)
+    return m.group(1) if m else None
+
+
+def fetch_ms_cameras() -> list[dict]:
+    req = urllib.request.Request(
+        MS_CAMERA_LIST_URL,
+        data=b"{}",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        markers = json.loads(resp.read())["d"]
+
+    site_ids = {}  # markerid -> site id, extracted up front so the parallel fetch below only does image lookups
+    for m in markers:
+        match = _MS_SITE_ID_RE.search(m.get("framehtml") or "")
+        if match:
+            site_ids[m["markerid"]] = match.group(1)
+
+    images = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(_fetch_ms_camera_image, sid): markerid for markerid, sid in site_ids.items()}
+        for future in futures:
+            markerid = futures[future]
+            try:
+                images[markerid] = future.result()
+            except Exception as e:
+                print(f"[radar-lab] MS camera bubble fetch error ({markerid}): {e}")
+
+    out = []
+    for m in markers:
+        image_url = images.get(m["markerid"])
+        if not image_url:
+            continue
+        out.append({
+            "id": f"MS-{m['markerid']}",
+            "name": m.get("tooltip") or m["markerid"],
+            "src": "MS",
+            "age": None,
+            "lat": m["lat"],
+            "lon": m["lon"],
+            "snapshot": image_url,
+        })
+    return out
+
+
+# Texas (drivetexas.org) runs on MapLarge, a commercial GIS/mapping data
+# platform -- a fifth distinct platform. Found 2026-09-25 the same way as
+# VA: the SPA's main bundle had zero literal https:// API strings, but
+# did reference VITE_ML_HOST/VITE_CAMERA_TABLE build-time constants
+# (`dtx-e-cdn.maplarge.com`, table `cameraPoint`) used to build calls to
+# MapLarge's own `Api/ProcessDirect?request=<json>` query endpoint --
+# `{"action":"table/query","query":{"sqlselect":[...],"table":
+# "appgeo/cameraPoint","take":N,"where":[]}}`, found by locating the
+# real `table/query` request object the app's own map-click handler
+# builds, not guessed. Verified live: 3,490 real cameras, real
+# coordinates (WKT, same format as parse_wkt_point already handles).
+#
+# Real, unavoidable difference from every other state here: TX has no
+# static snapshot image at all -- "imageurl" in the raw data is a
+# literally-broken `https://localhost/...` placeholder (confirmed dead,
+# not just untested). The only real, working media is "httpsurl", a
+# live HLS stream (skyvdn.com, the same CDN family SC/VA's snapshot
+# images happen to also sit on) -- and it's tokenized with a ~5 minute
+# expiry (decoded a real token's iat/exp: exactly 300s), which is why
+# this is the one state whose camera dicts carry "stream" instead of
+# "snapshot" (see group_cameras_by_location) and why the frontend needs
+# real HLS.js video playback instead of an <img> tag for these. A token
+# minted when the state's camera list is fetched will usually still be
+# fresh when shown (STATE_CAMERA_CACHE_SEC is also 5 minutes), but a
+# stream opened right at the end of that cache window can find its own
+# token already expired -- a real, accepted rough edge given TX's actual
+# API shape, not something worth re-architecting the shared cache TTL
+# over for one state.
+TX_MAPLARGE_HOST = "https://dtx-e-cdn.maplarge.com"
+TX_CAMERA_TABLE = "appgeo/cameraPoint"
+
+
+def fetch_tx_cameras() -> list[dict]:
+    request_obj = {
+        "action": "table/query",
+        "query": {
+            "sqlselect": ["description", "name", "httpsurl", "XY"],
+            "start": 0,
+            "table": TX_CAMERA_TABLE,
+            "take": 5000,
+            "where": [],
+        },
+    }
+    qs = urllib.parse.urlencode({"request": json.dumps(request_obj)})
+    req = urllib.request.Request(
+        f"{TX_MAPLARGE_HOST}/Api/ProcessDirect?{qs}",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.loads(resp.read())
+    # Column-oriented response (one parallel array per field), not one
+    # object per row -- confirmed live, not assumed.
+    columns = payload.get("data", {}).get("data", {})
+    names = columns.get("name", [])
+    descriptions = columns.get("description", [])
+    streams = columns.get("httpsurl", [])
+    xys = columns.get("XY", [])
+
+    out = []
+    for i, name in enumerate(names):
+        stream = streams[i] if i < len(streams) else None
+        point = parse_wkt_point(xys[i]) if i < len(xys) else None
+        if not stream or not point:
+            continue
+        lon, lat = point
+        description = descriptions[i] if i < len(descriptions) else None
+        out.append({
+            "id": f"TX-{name}",
+            "name": description or name,
+            "src": "TX",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "stream": stream,
+        })
+    return out
+
+
 # Separate from _camera_cache (the near-radar-site 4-state one) --
 # whole-state pulls are much more expensive (many paginated requests for
 # a big state), so cached longer (5min not 2min) and only ever fetched
@@ -944,8 +1515,20 @@ def fetch_iteris_cameras(url: str, state_code: str) -> list[dict]:
 _state_camera_cache: dict[str, dict] = {}
 STATE_CAMERA_CACHE_SEC = 300
 SUPPORTED_CAMERA_STATES = sorted(
-    set(STATE_DATATABLES_DOMAINS) | set(STATE_ITERIS_GEOJSON_URLS) | TRAVELMIDWEST_STATES | {"KY", "HI"}
+    set(STATE_DATATABLES_DOMAINS) | set(STATE_ITERIS_GEOJSON_URLS) | TRAVELMIDWEST_STATES
+    | {"KY", "HI", "VA", "MS", "TX"}
 )
+
+
+# TX's camera "URLs" are really JWT tokens with a hard ~5min server-side
+# expiry baked in by MapLarge (decoded a real one: exp-iat = exactly
+# 300s) -- confirmed live 2026-09-25 that the default 5-minute cache TTL
+# means a stream clicked late in its cache window is already dead (real
+# 401, not theoretical). The underlying query itself is fast (~0.4s for
+# all 3,491 cameras, measured live) so refetching far more often than
+# the other states is cheap here -- a real per-state override, not a
+# blanket change to STATE_CAMERA_CACHE_SEC for everyone.
+STATE_CAMERA_CACHE_OVERRIDES = {"TX": 60}
 
 
 def get_cameras_for_state(state_code: str) -> list[dict] | None:
@@ -954,8 +1537,9 @@ def get_cameras_for_state(state_code: str) -> list[dict] | None:
     right now", which the frontend shows differently."""
     state_code = state_code.upper()
     now = time.time()
+    ttl = STATE_CAMERA_CACHE_OVERRIDES.get(state_code, STATE_CAMERA_CACHE_SEC)
     cached = _state_camera_cache.get(state_code)
-    if cached and now - cached["ts"] < STATE_CAMERA_CACHE_SEC:
+    if cached and now - cached["ts"] < ttl:
         return cached["data"]
 
     if state_code in STATE_DATATABLES_DOMAINS:
@@ -968,6 +1552,12 @@ def get_cameras_for_state(state_code: str) -> list[dict] | None:
         cams = fetch_kytc_cameras()
     elif state_code == "HI":
         cams = fetch_hazcams()  # not DOT cameras -- USGS volcano hazard webcams
+    elif state_code == "VA":
+        cams = fetch_va_cameras()
+    elif state_code == "MS":
+        cams = fetch_ms_cameras()
+    elif state_code == "TX":
+        cams = fetch_tx_cameras()
     else:
         return None
 
@@ -1097,6 +1687,97 @@ def get_gps_position() -> dict | None:
     except Exception:
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# User-drawn pins/shapes -- auto-saved export (2026-09-24). CSV is pins
+# only (a flat lat/lon/name table is the whole point of CSV; shapes don't
+# fit that shape at all). KML carries both pins and shapes and is the
+# real target -- it's Google My Maps' native import format, so "export
+# to Google Maps" means this file, not the CSV.
+# ---------------------------------------------------------------------------
+
+def _safe_session_id(session_id: str) -> str:
+    # Used directly in a filename -- only allow what a timestamp-derived
+    # id should ever contain, so a crafted session_id can't be used for
+    # path traversal or to write outside EXPORTS_DIR.
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", session_id)[:64]
+    return cleaned or "session"
+
+
+def write_pins_csv(path: Path, pins: list[dict]):
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["name", "notes", "lat", "lon"])
+        for pin in pins:
+            writer.writerow([pin.get("name", ""), pin.get("notes", ""), pin.get("lat"), pin.get("lon")])
+
+
+def _circle_ring(lat: float, lon: float, radius_m: float, points: int = 36) -> list[tuple[float, float]]:
+    # KML has no native circle primitive -- approximate with a polygon
+    # ring, the standard way to represent one in KML. Same flat-local-
+    # plane approximation used elsewhere in this app for short distances.
+    ring = []
+    for i in range(points + 1):  # +1 to close the ring back on itself
+        angle = (i / points) * 2 * math.pi
+        dlat = (radius_m * math.cos(angle)) / 111_320
+        dlon = (radius_m * math.sin(angle)) / (111_320 * math.cos(math.radians(lat)))
+        ring.append((lat + dlat, lon + dlon))
+    return ring
+
+
+def write_marks_kml(path: Path, pins: list[dict], shapes: list[dict]):
+    kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+    doc = ET.SubElement(kml, "Document")
+
+    for pin in pins:
+        pm = ET.SubElement(doc, "Placemark")
+        ET.SubElement(pm, "name").text = pin.get("name") or "Pin"
+        if pin.get("notes"):
+            ET.SubElement(pm, "description").text = pin["notes"]
+        point = ET.SubElement(pm, "Point")
+        ET.SubElement(point, "coordinates").text = f"{pin['lon']},{pin['lat']},0"
+
+    for shape in shapes:
+        pm = ET.SubElement(doc, "Placemark")
+        ET.SubElement(pm, "name").text = shape.get("name") or shape.get("type", "Shape").title()
+        if shape.get("notes"):
+            ET.SubElement(pm, "description").text = shape["notes"]
+        shape_type = shape.get("type")
+        if shape_type == "circle":
+            center = shape.get("center") or [0, 0]
+            ring = _circle_ring(center[0], center[1], float(shape.get("radius_m", 0)))
+            poly = ET.SubElement(pm, "Polygon")
+            outer = ET.SubElement(poly, "outerBoundaryIs")
+            ring_el = ET.SubElement(outer, "LinearRing")
+            ET.SubElement(ring_el, "coordinates").text = " ".join(f"{lon},{lat},0" for lat, lon in ring)
+        elif shape_type == "polyline":
+            line = ET.SubElement(pm, "LineString")
+            coords = shape.get("coordinates") or []
+            ET.SubElement(line, "coordinates").text = " ".join(f"{lon},{lat},0" for lat, lon in coords)
+        else:  # polygon / rectangle -- both are just closed rings in KML
+            poly = ET.SubElement(pm, "Polygon")
+            outer = ET.SubElement(poly, "outerBoundaryIs")
+            ring_el = ET.SubElement(outer, "LinearRing")
+            coords = shape.get("coordinates") or []
+            if coords and coords[0] != coords[-1]:
+                coords = coords + [coords[0]]  # KML rings must close back on their own first point
+            ET.SubElement(ring_el, "coordinates").text = " ".join(f"{lon},{lat},0" for lat, lon in coords)
+
+    ET.ElementTree(kml).write(path, xml_declaration=True, encoding="UTF-8")
+
+
+_latest_export = {"csv": None, "kml": None}  # Path | None, for the manual "download latest" buttons
+
+
+def write_marks_export(session_id: str, pins: list[dict], shapes: list[dict]):
+    safe_id = _safe_session_id(session_id)
+    csv_path = EXPORTS_DIR / f"marks_{safe_id}.csv"
+    kml_path = EXPORTS_DIR / f"marks_{safe_id}.kml"
+    write_pins_csv(csv_path, pins)
+    write_marks_kml(kml_path, pins, shapes)
+    _latest_export["csv"] = csv_path
+    _latest_export["kml"] = kml_path
 
 
 # ---------------------------------------------------------------------------
@@ -1328,6 +2009,43 @@ class Handler(BaseHTTPRequestHandler):
             pos = get_gps_position()
             self._json(pos or {"available": False})
 
+        elif path == "/api/lightning":
+            if not LIGHTNING_AVAILABLE:
+                self._json({"error": "lightning not available on this platform (netCDF4 not installed)"}, 501)
+                return
+            self._json({"flashes": LIGHTNING_CACHE.get(), "window_minutes": GLM_WINDOW_MINUTES})
+
+        elif path == "/api/snowplows":
+            trucks, updated = SNOWPLOW_CACHE.get()
+            self._json({"trucks": trucks, "updated": updated})
+
+        elif path == "/api/obs":
+            try:
+                lat = float(qs["lat"][0])
+                lon = float(qs["lon"][0])
+                radius_km = float(qs.get("radius_km", ["100"])[0])
+            except (KeyError, ValueError):
+                self._json({"error": "lat & lon query params required"}, 400)
+                return
+            try:
+                stations = get_madis_obs(lat, lon, radius_km)
+            except Exception as e:
+                self._json({"error": str(e)}, 502)
+                return
+            self._json({"stations": stations})
+
+        elif path == "/api/marks/latest.csv":
+            if _latest_export["csv"] is None:
+                self.send_error(404)
+                return
+            self._binary(_latest_export["csv"].read_bytes(), "text/csv")
+
+        elif path == "/api/marks/latest.kml":
+            if _latest_export["kml"] is None:
+                self.send_error(404)
+                return
+            self._binary(_latest_export["kml"].read_bytes(), "application/vnd.google-earth.kml+xml")
+
         elif path == "/" or path == "":
             self._static(WEB_DIR / "index.html")
 
@@ -1335,13 +2053,38 @@ class Handler(BaseHTTPRequestHandler):
             rel = path.lstrip("/")
             self._static(WEB_DIR / rel)
 
+    def do_POST(self):
+        # Only one POST route exists -- the pin/shape auto-save. Every
+        # other endpoint in this app is a GET (this scaffold's established
+        # "everything's a query param" style), but pin/shape data is
+        # structured and can grow arbitrarily large as someone keeps
+        # drawing, which doesn't fit in a query string the way e.g.
+        # /api/site?set= does.
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/marks/save":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length))
+            session_id = str(body.get("session_id") or "session")
+            pins = body.get("pins") or []
+            shapes = body.get("shapes") or []
+            write_marks_export(session_id, pins, shapes)
+            self._json({"ok": True, "pins": len(pins), "shapes": len(shapes)})
+        except Exception as e:  # noqa: BLE001 -- a malformed request must not crash the server
+            self._json({"error": str(e)}, 400)
+
 
 def main():
     get_cache(SITE)  # start warming the default site immediately, not on first request
     threading.Thread(target=mosaic_poll_loop, daemon=True).start()
+    threading.Thread(target=lightning_poll_loop, daemon=True).start()
+    threading.Thread(target=snowplow_poll_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[radar-lab] serving on :{PORT}, site={SITE}, poll every {POLL_INTERVAL_SEC}s, "
-          f"mosaic every {MOSAIC_POLL_INTERVAL_SEC}s")
+          f"mosaic every {MOSAIC_POLL_INTERVAL_SEC}s, lightning every {GLM_POLL_INTERVAL_SEC}s, "
+          f"snowplows every {SNOWPLOW_POLL_INTERVAL_SEC}s")
     server.serve_forever()
 
 

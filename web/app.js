@@ -79,31 +79,43 @@ const BASE_LAYERS = {
   },
 };
 
-// GOES-East cloud imagery, NASA GIBS (WMTS) -- free, no API key,
-// confirmed live 2026-09-23, real ~10min update cadence. "default" in
-// the time slot is a GIBS shortcut for "latest available tile" -- saves
-// having to compute/guess a valid timestamp client-side (there's real
-// latency between "now" and what's actually been processed).
-// IR (Band 13) works day and night; Visible and GeoColor only show
-// anything meaningful in daylight -- that's a real property of the data,
-// not a bug, worth knowing when picking which to leave on overnight.
-// maxNativeZoom values are real, checked against GIBS' own
-// TileMatrixSet definitions 2026-09-23 (2km set: zoom 0-5, 1km set:
-// zoom 0-6) -- not guessed. Leaflet upscales past this rather than
-// showing blank tiles, which is the right behavior for a coarser
-// overlay under a much higher-zoom base map.
-const GOES_LAYERS = {
-  ir: { id: "GOES-East_ABI_Band13_Clean_Infrared", matrixSet: "2km", maxNativeZoom: 5, label: "IR (Band 13, day/night)" },
-  visible: { id: "GOES-East_ABI_Band2_Red_Visible_1km", matrixSet: "1km", maxNativeZoom: 6, label: "Visible (Band 2, day only)" },
-  geocolor: { id: "GOES-East_ABI_GeoColor", matrixSet: "1km", maxNativeZoom: 6, label: "GeoColor (day/night composite)" },
+// GOES cloud imagery, NASA GIBS (WMTS) -- free, no API key, confirmed
+// live 2026-09-23 (GOES-East only then), expanded 2026-09-24 to every
+// GOES-East AND GOES-West product GIBS actually publishes -- checked
+// directly against GIBS' own WMTSCapabilities.xml (not guessed, and not
+// every raw ABI band -- GIBS itself only publishes these 6 pre-built
+// products per satellite, real ~10min update cadence for all of them).
+// "default" in the time slot is a GIBS shortcut for "latest available
+// tile" -- saves having to compute/guess a valid timestamp client-side.
+// IR/Air Mass/Dust/Fire Temperature work day and night; Visible and
+// GeoColor only show anything meaningful in daylight -- a real property
+// of the data, not a bug, worth knowing when picking which to leave on
+// overnight. maxNativeZoom values are real, checked against GIBS' own
+// TileMatrixSet definitions (2km set: zoom 0-5, 1km set: zoom 0-6) --
+// shared by every layer on that matrix set, not guessed per-product.
+// Leaflet upscales past this rather than showing blank tiles, the right
+// behavior for a coarser overlay under a much higher-zoom base map.
+const GOES_SATELLITES = {
+  east: { prefix: "GOES-East", label: "GOES-East (75°W)" },
+  west: { prefix: "GOES-West", label: "GOES-West (137°W) -- fills the gap East alone leaves over the Pacific/western US" },
 };
-function goesTileUrl(key) {
-  const g = GOES_LAYERS[key];
-  return `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/${g.id}/default/default/${g.matrixSet}/{z}/{y}/{x}.png`;
+const GOES_PRODUCTS = {
+  ir: { suffix: "ABI_Band13_Clean_Infrared", matrixSet: "2km", maxNativeZoom: 5, label: "IR (Band 13, day/night)" },
+  visible: { suffix: "ABI_Band2_Red_Visible_1km", matrixSet: "1km", maxNativeZoom: 6, label: "Visible (Band 2, day only)" },
+  geocolor: { suffix: "ABI_GeoColor", matrixSet: "1km", maxNativeZoom: 6, label: "GeoColor (day/night composite)" },
+  airmass: { suffix: "ABI_Air_Mass", matrixSet: "2km", maxNativeZoom: 5, label: "Air Mass (jet stream/moisture, day/night)" },
+  dust: { suffix: "ABI_Dust", matrixSet: "1km", maxNativeZoom: 6, label: "Dust (day/night)" },
+  firetemp: { suffix: "ABI_FireTemp", matrixSet: "1km", maxNativeZoom: 6, label: "Fire Temperature (day/night)" },
+};
+function goesTileUrl(satelliteKey, productKey) {
+  const sat = GOES_SATELLITES[satelliteKey];
+  const prod = GOES_PRODUCTS[productKey];
+  return `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/${sat.prefix}_${prod.suffix}/default/default/${prod.matrixSet}/{z}/{y}/{x}.png`;
 }
 
 let panels = [];
-let goesLayerKey = "off"; // "off" | "ir" | "visible" | "geocolor"
+let goesLayerKey = "off"; // "off" | one of GOES_PRODUCTS' keys
+let goesSatelliteKey = "east"; // one of GOES_SATELLITES' keys
 let baseLayerKey = "streets"; // "streets" | "dark" | "satellite"
 let syncEnabled = false;
 let syncingView = false; // re-entrancy guard for the pan/zoom sync loop
@@ -118,6 +130,19 @@ const gpsTrailPoints = [];
 const scanDataCache = new Map(); // "product:ts" -> decoded JSON, avoids
                                   // refetching the same scan twice when
                                   // two panels happen to want it.
+
+// User-drawn pins/shapes (2026-09-24) -- session-only by design (nothing
+// here is ever loaded back from the server), but auto-saved to a
+// timestamped file on the server as a rolling backup -- see
+// scheduleMarksAutoSave() and /api/marks/save in radar_lab.py.
+let userMarks = { pins: [], shapes: [] };
+let marksSessionId = null; // set on first drawn item; a fresh one after "Clear all" so that doesn't overwrite the prior session's saved file
+let markIdCounter = 0;
+let marksAutoSaveTimer = null;
+
+function nextMarkId() {
+  return `mark-${Date.now()}-${markIdCounter++}`;
+}
 
 const statusEl = document.getElementById("status");
 const siteEl = document.getElementById("site");
@@ -404,10 +429,77 @@ function createPanel(product, site) {
     gpsTrail: L.polyline([], { color: "#38bdf8", weight: 2 }).addTo(map),
     siteMarkersLayer: L.layerGroup().addTo(map),
     mosaicOverlay: null, // current national-mosaic imageOverlay, if shown (see refreshMosaic)
+    marksLayer: L.featureGroup().addTo(map), // user-drawn pins/shapes, see redrawUserMarks()
+    lightningLayer: L.layerGroup().addTo(map), // GOES-East + GOES-West GLM flashes, see refreshLightning
+    snowplowLayer: L.layerGroup().addTo(map), // live Iowa DOT truck positions, see refreshSnowplows
+    obsLayer: L.layerGroup().addTo(map), // MADIS surface weather stations, see refreshObs
   };
   siteSelectEl.value = panel.site;
 
   siteSelectEl.addEventListener("change", () => switchPanelSite(panel, siteSelectEl.value));
+
+  // Pins/shapes (2026-09-24) -- every panel gets its own full draw/edit
+  // toolbar (topright, clear of Leaflet's own zoom control and the
+  // .panel-toolbar HTML overlay, both topleft) since these mark real
+  // locations independent of whichever radar site a panel happens to be
+  // showing -- same "shared data, drawn into every panel's own layer"
+  // pattern as cameras/alerts/NST/NMD. userMarks is the one shared source
+  // of truth; redrawUserMarks() (called after every create/edit/delete,
+  // on whichever panel it happened on) rebuilds *all* panels' marksLayer
+  // from it, so a pin dropped in panel 3 shows up in panel 1 too.
+  map.addControl(new L.Control.Draw({
+    position: "topright",
+    draw: { marker: true, polygon: { allowIntersection: false }, rectangle: true, polyline: true, circle: true, circlemarker: false },
+    edit: { featureGroup: panel.marksLayer },
+  }));
+  map.on(L.Draw.Event.CREATED, (e) => {
+    const id = nextMarkId();
+    if (e.layerType === "marker") {
+      const ll = e.layer.getLatLng();
+      userMarks.pins.push({ id, name: `Pin ${userMarks.pins.length + 1}`, notes: "", lat: ll.lat, lon: ll.lng });
+    } else if (e.layerType === "circle") {
+      const ll = e.layer.getLatLng();
+      userMarks.shapes.push({ id, type: "circle", name: `Shape ${userMarks.shapes.length + 1}`, notes: "", center: [ll.lat, ll.lng], radius_m: e.layer.getRadius() });
+    } else if (e.layerType === "polyline") {
+      userMarks.shapes.push({ id, type: "polyline", name: `Shape ${userMarks.shapes.length + 1}`, notes: "", coordinates: e.layer.getLatLngs().map((ll) => [ll.lat, ll.lng]) });
+    } else {
+      // polygon or rectangle -- both are just a closed vertex ring
+      userMarks.shapes.push({ id, type: e.layerType, name: `Shape ${userMarks.shapes.length + 1}`, notes: "", coordinates: e.layer.getLatLngs()[0].map((ll) => [ll.lat, ll.lng]) });
+    }
+    redrawUserMarks();
+    scheduleMarksAutoSave();
+  });
+  map.on(L.Draw.Event.EDITED, (e) => {
+    e.layers.eachLayer((layer) => {
+      const pin = userMarks.pins.find((p) => p.id === layer._markId);
+      if (pin) {
+        const ll = layer.getLatLng();
+        pin.lat = ll.lat; pin.lon = ll.lng;
+        return;
+      }
+      const shape = userMarks.shapes.find((s) => s.id === layer._markId);
+      if (!shape) return;
+      if (shape.type === "circle") {
+        const ll = layer.getLatLng();
+        shape.center = [ll.lat, ll.lng];
+        shape.radius_m = layer.getRadius();
+      } else if (shape.type === "polyline") {
+        shape.coordinates = layer.getLatLngs().map((ll) => [ll.lat, ll.lng]);
+      } else {
+        shape.coordinates = layer.getLatLngs()[0].map((ll) => [ll.lat, ll.lng]);
+      }
+    });
+    redrawUserMarks();
+    scheduleMarksAutoSave();
+  });
+  map.on(L.Draw.Event.DELETED, (e) => {
+    e.layers.eachLayer((layer) => {
+      userMarks.pins = userMarks.pins.filter((p) => p.id !== layer._markId);
+      userMarks.shapes = userMarks.shapes.filter((s) => s.id !== layer._markId);
+    });
+    redrawUserMarks();
+    scheduleMarksAutoSave();
+  });
 
   select.addEventListener("change", () => {
     panel.product = select.value;
@@ -429,6 +521,17 @@ function createPanel(product, site) {
     syncingView = false;
   });
 
+  // Texas camera popups embed real <video> elements (see buildCameraPopup)
+  // -- Leaflet only puts the popup's HTML into the DOM once it opens, so
+  // HLS playback can't be wired up until then. Torn down again on close
+  // rather than just left running, since it's a live network stream.
+  map.on("popupopen", (e) => {
+    e.popup.getElement()?.querySelectorAll("video.cam-stream").forEach(attachHlsVideo);
+  });
+  map.on("popupclose", (e) => {
+    e.popup.getElement()?.querySelectorAll("video.cam-stream").forEach(detachHlsVideo);
+  });
+
   applyGoesLayer(panel);
   return panel;
 }
@@ -439,11 +542,11 @@ function applyGoesLayer(panel) {
     panel.goesLayer = null;
   }
   if (goesLayerKey === "off") return;
-  const g = GOES_LAYERS[goesLayerKey];
-  panel.goesLayer = L.tileLayer(goesTileUrl(goesLayerKey), {
-    attribution: "GOES-East imagery &copy; NASA GIBS / NOAA",
+  const prod = GOES_PRODUCTS[goesLayerKey];
+  panel.goesLayer = L.tileLayer(goesTileUrl(goesSatelliteKey, goesLayerKey), {
+    attribution: `${GOES_SATELLITES[goesSatelliteKey].prefix} imagery &copy; NASA GIBS / NOAA`,
     opacity: 0.7,
-    maxNativeZoom: g.maxNativeZoom,
+    maxNativeZoom: prod.maxNativeZoom,
     maxZoom: 18,
   }).addTo(panel.map);
 }
@@ -485,6 +588,9 @@ function setLayout(n) {
   refreshLevel3();
   refreshSitePills();
   refreshMosaic();
+  refreshLightning();
+  refreshSnowplows();
+  refreshObs();
 }
 
 // ---------------------------------------------------------------------
@@ -615,6 +721,46 @@ async function refreshScanList() {
 // drawn into every panel's own layer group.
 // ---------------------------------------------------------------------
 
+// Texas cameras (2026-09-25) have no static snapshot at all -- only a
+// live HLS stream (see fetch_tx_cameras in radar_lab.py for why). Real
+// video playback needed instead of an <img>, unlike every other camera
+// source in this app. hls.js handles browsers that need it; Safari/iOS
+// play HLS natively via the plain <video> element and don't need the
+// library at all -- checked with canPlayType before reaching for hls.js
+// rather than loading it unconditionally.
+const hlsInstances = new Map(); // <video> element -> its Hls.js instance, so popupclose can tear it down
+let hlsVideoIdCounter = 0;
+
+function attachHlsVideo(video) {
+  const src = video.dataset.hlsSrc;
+  if (!src) return;
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = src;
+    video.play().catch(() => {}); // autoplay can be blocked by the browser -- not an error worth surfacing, the controls are right there
+  } else if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls();
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hlsInstances.set(video, hls);
+  }
+}
+
+function detachHlsVideo(video) {
+  // Real reason this matters, not just cleanliness: these are live
+  // streams -- an HLS session left running after the popup closes keeps
+  // pulling segments over the network for a camera nobody's looking at
+  // anymore.
+  const hls = hlsInstances.get(video);
+  if (hls) {
+    hls.destroy();
+    hlsInstances.delete(video);
+  }
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
 function buildCameraPopup(cam) {
   // Some locations have multiple real cameras at the same coordinates
   // (found 2026-09-23 near Evansville, IN -- InDOT publishes 3 separate
@@ -622,18 +768,35 @@ function buildCameraPopup(cam) {
   // marker with several snapshots instead of stacking identical markers
   // invisibly on top of each other, which was making all but the
   // topmost unclickable.
+  // referrerpolicy="no-referrer": found live 2026-09-25 that
+  // cctv.travelmidwest.com (859 of Illinois's 1,334 cameras -- IDOT/
+  // DuPage/Kane county feeds) actively 403s any request carrying a
+  // Referer header that isn't its own site, which is exactly what a
+  // browser sends by default on an <img> tag -- verified the same URL
+  // returns 200 with no Referer at all but 403 with this page's own
+  // origin as Referer. Suppressing it here fixes real broken images,
+  // not just IL's -- any other source with the same hotlink-protection
+  // habit gets the same fix for free.
   const images = (cam.snapshots || [])
     .map((url) =>
-      `<img src="${url}" class="cam-img" data-base="${url}" ` +
+      `<img src="${url}" class="cam-img" data-base="${url}" referrerpolicy="no-referrer" ` +
       `style="max-width:240px;display:block;margin-top:4px;cursor:zoom-in" ` +
       `onerror="this.style.display='none'">`
+    )
+    .join("");
+  const videos = (cam.streams || [])
+    .map((url) =>
+      `<video class="cam-stream" data-hls-src="${url}" data-hls-id="${hlsVideoIdCounter++}" ` +
+      `controls muted playsinline width="240" height="160" ` +
+      `style="max-width:240px;display:block;margin-top:4px;background:#000"></video>`
     )
     .join("");
   // distance_km only exists in "near radar site" mode, not state mode --
   // state-scoped results aren't measured against any particular point.
   const distancePart = cam.distance_km !== undefined ? ` &middot; ${cam.distance_km} km` : "";
-  const countPart = cam.snapshots?.length > 1 ? ` &middot; ${cam.snapshots.length} cameras` : "";
-  return `<b>${cam.name || cam.id}</b><br>${cam.src || ""}${distancePart}${countPart}<br>${images}`;
+  const total = (cam.snapshots?.length || 0) + (cam.streams?.length || 0);
+  const countPart = total > 1 ? ` &middot; ${total} cameras` : "";
+  return `<b>${cam.name || cam.id}</b><br>${cam.src || ""}${distancePart}${countPart}<br>${images}${videos}`;
 }
 
 async function refreshCameras() {
@@ -698,7 +861,7 @@ function openCameraLightbox(url) {
       "position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:5000;" +
       "display:none;align-items:center;justify-content:center;cursor:zoom-out";
     lightboxEl.innerHTML =
-      '<img id="camera-lightbox-img" class="cam-img" style="max-width:95vw;max-height:95vh;">';
+      '<img id="camera-lightbox-img" class="cam-img" referrerpolicy="no-referrer" style="max-width:95vw;max-height:95vh;">';
     lightboxEl.addEventListener("click", () => { lightboxEl.style.display = "none"; });
     document.body.appendChild(lightboxEl);
   }
@@ -820,6 +983,10 @@ document.getElementById("goes-layer").addEventListener("change", (e) => {
   goesLayerKey = e.target.value;
   panels.forEach(applyGoesLayer);
 });
+document.getElementById("goes-satellite").addEventListener("change", (e) => {
+  goesSatelliteKey = e.target.value;
+  panels.forEach(applyGoesLayer); // no-op if goesLayerKey is "off" -- applyGoesLayer bails out early in that case
+});
 
 document.getElementById("toggle-sync").addEventListener("change", (e) => {
   syncEnabled = e.target.checked;
@@ -871,6 +1038,9 @@ document.getElementById("toggle-mosaic").addEventListener("change", (e) => {
   setRadarLayersVisible(!e.target.checked);
   refreshMosaic();
 });
+document.getElementById("toggle-lightning").addEventListener("change", refreshLightning);
+document.getElementById("toggle-snowplows").addEventListener("change", refreshSnowplows);
+document.getElementById("toggle-obs").addEventListener("change", refreshObs);
 
 // ---------------------------------------------------------------------
 // Radar site switching
@@ -969,6 +1139,58 @@ function refreshSitePills() {
   }
 }
 
+// Rebuilds *every* panel's marksLayer from the one shared userMarks
+// array -- called after every create/edit/delete (see createPanel's
+// L.Draw.Event handlers), on whichever panel the change happened on, so
+// a pin dropped in one panel shows up in all of them. Simplest correct
+// approach: destroy and recreate every layer rather than trying to patch
+// individual ones across up to 4 separate FeatureGroups.
+function redrawUserMarks() {
+  for (const p of panels) {
+    p.marksLayer.clearLayers();
+    for (const pin of userMarks.pins) {
+      const layer = L.marker([pin.lat, pin.lon])
+        .bindPopup(`<b>${pin.name}</b>${pin.notes ? `<br>${pin.notes}` : ""}`);
+      layer._markId = pin.id;
+      p.marksLayer.addLayer(layer);
+    }
+    for (const shape of userMarks.shapes) {
+      let layer;
+      if (shape.type === "circle") {
+        layer = L.circle(shape.center, { radius: shape.radius_m });
+      } else if (shape.type === "polyline") {
+        layer = L.polyline(shape.coordinates);
+      } else {
+        // rectangle re-renders as a plain polygon -- same vertices, just
+        // editable as free vertices afterward instead of a locked
+        // rectangle shape; an acceptable simplification, not a bug.
+        layer = L.polygon(shape.coordinates);
+      }
+      layer.bindPopup(`<b>${shape.name}</b>${shape.notes ? `<br>${shape.notes}` : ""}`);
+      layer._markId = shape.id;
+      p.marksLayer.addLayer(layer);
+    }
+  }
+}
+
+function scheduleMarksAutoSave() {
+  if (!marksSessionId) marksSessionId = new Date().toISOString().replace(/[:.]/g, "-");
+  clearTimeout(marksAutoSaveTimer);
+  // Debounced, not immediate -- drawing several pins/shapes in quick
+  // succession shouldn't fire a save per click.
+  marksAutoSaveTimer = setTimeout(async () => {
+    try {
+      await fetch("/api/marks/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: marksSessionId, pins: userMarks.pins, shapes: userMarks.shapes }),
+      });
+    } catch (e) {
+      console.error("marks auto-save failed", e);
+    }
+  }, 2000);
+}
+
 let mosaicUpdated = null; // last-known server render timestamp, avoids reloading an unchanged image
 
 function isMosaicActive() {
@@ -1014,6 +1236,155 @@ async function refreshMosaic() {
     }
   } catch (e) {
     console.error("mosaic fetch failed", e);
+  }
+}
+
+// GOES-East lightning (GLM), built 2026-09-24 -- a national feed
+// independent of whichever radar site(s) are selected, same shape as
+// refreshMosaic() above. Shared across every panel (one fetch, drawn
+// into each panel's own layer), same pattern as cameras/alerts/NST/NMD.
+function lightningMarkerStyle(ageSec, windowSec) {
+  // Fresher flashes render brighter/bigger -- recency is the whole point
+  // of a rolling lightning display, a flat dot for something nearly
+  // expired vs. one second old would lose that. windowSec comes from the
+  // server's own response (GLM_WINDOW_MINUTES) rather than being
+  // hardcoded here -- found live 2026-09-24 that a hardcoded 15min here
+  // silently went stale the moment the server-side window got shortened
+  // to 5min (too many flashes on screen during an active storm), leaving
+  // the fade curve applying the old window's timing.
+  const t = Math.min(ageSec / windowSec, 1);
+  return { radius: 6 - 3 * t, color: "#fde047", fillColor: "#fde047", fillOpacity: 0.9 - 0.6 * t, weight: 0 };
+}
+
+async function refreshLightning() {
+  const on = document.getElementById("toggle-lightning").checked;
+  if (!on) {
+    for (const p of panels) p.lightningLayer.clearLayers();
+    return;
+  }
+  try {
+    const { flashes, window_minutes } = await fetchJSON("/api/lightning");
+    const windowSec = window_minutes * 60;
+    const now = Date.now();
+    for (const p of panels) {
+      p.lightningLayer.clearLayers();
+      for (const flash of flashes) {
+        const ageSec = (now - new Date(flash.time).getTime()) / 1000;
+        L.circleMarker([flash.lat, flash.lon], lightningMarkerStyle(ageSec, windowSec))
+          .bindPopup(`Lightning flash (${flash.satellite})<br>${Math.round(ageSec)}s ago<br>${flash.energy_j.toExponential(2)} J`)
+          .addTo(p.lightningLayer);
+      }
+    }
+  } catch (e) {
+    console.error("lightning fetch failed", e);
+  }
+}
+
+// Live Iowa DOT snowplow trucks, built 2026-09-25 -- unlike every other
+// overlay in this app this is a genuinely moving-vehicle feed: real
+// heading/speed, not just a static point. The source only reports
+// trucks currently moving >3mph, so this is legitimately empty outside
+// real winter plowing operations -- an empty layer here isn't a bug,
+// it's the real current state of the data (confirmed server-side too,
+// see fetch_ia_snowplows in radar_lab.py).
+function snowplowIcon(headingDeg) {
+  // A plain "▲" glyph points up (north) at 0deg -- CSS rotate() is also
+  // clockwise-positive, so rotating directly by the truck's real compass
+  // heading (0-360, clockwise from north) needs no offset correction.
+  const rotation = headingDeg ?? 0;
+  return L.divIcon({
+    className: "snowplow-icon-wrap",
+    html: `<span class="snowplow-icon" style="transform:translate(-50%,-50%) rotate(${rotation}deg)">&#9650;</span>`,
+    iconSize: [1, 1],
+    iconAnchor: [0, 0],
+  });
+}
+
+async function refreshSnowplows() {
+  const on = document.getElementById("toggle-snowplows").checked;
+  if (!on) {
+    for (const p of panels) p.snowplowLayer.clearLayers();
+    return;
+  }
+  try {
+    const { trucks } = await fetchJSON("/api/snowplows");
+    for (const p of panels) {
+      p.snowplowLayer.clearLayers();
+      for (const truck of trucks) {
+        const details = [];
+        if (truck.route) details.push(truck.route);
+        if (truck.speed_mph != null) details.push(`${Math.round(truck.speed_mph)} mph`);
+        if (truck.material) details.push(truck.material);
+        const temps = [];
+        if (truck.road_temp_f != null) temps.push(`road ${Math.round(truck.road_temp_f)}&deg;F`);
+        if (truck.air_temp_f != null) temps.push(`air ${Math.round(truck.air_temp_f)}&deg;F`);
+        const popup = `<b>Plow ${truck.label || truck.id}</b>` +
+          (details.length ? `<br>${details.join(" &middot; ")}` : "") +
+          (temps.length ? `<br>${temps.join(" &middot; ")}` : "") +
+          (truck.updated ? `<br><span style="opacity:.7">updated ${truck.updated}</span>` : "");
+        L.marker([truck.lat, truck.lon], { icon: snowplowIcon(truck.heading_deg) })
+          .bindPopup(popup)
+          .addTo(p.snowplowLayer);
+      }
+    }
+    // Only worth a status-line mention when there's actually something
+    // to report -- this is empty essentially all year outside real
+    // winter operations, and clobbering more useful status text (e.g. a
+    // site-switch in progress) every single tick with "0 snowplows"
+    // would be pure noise most of the time.
+    if (trucks.length) setStatus(`showing ${trucks.length} active snowplow${trucks.length === 1 ? "" : "s"} (Iowa)`);
+  } catch (e) {
+    console.error("snowplow fetch failed", e);
+  }
+}
+
+// MADIS surface weather stations, built 2026-09-25 -- real-time temp/
+// dewpoint/humidity/wind/pressure, scoped near the active radar site
+// (same bounding-box-around-siteLatLon shape as the near-site camera
+// mode) rather than a state picker, per what was actually asked for.
+// Off by default (unlike most overlays here) -- a real MADIS bounding
+// box can easily return several hundred stations (729 in one live test
+// this session), dense enough that showing it unconditionally on first
+// load would clutter the map before anyone's asked for it.
+function obsIcon(tempF) {
+  const label = tempF != null ? Math.round(tempF) : "?";
+  return L.divIcon({
+    className: "obs-icon-wrap",
+    html: `<span class="obs-icon">${label}&deg;</span>`,
+    iconSize: [1, 1],
+    iconAnchor: [0, 0],
+  });
+}
+
+async function refreshObs() {
+  const on = document.getElementById("toggle-obs").checked;
+  if (!on || !siteLatLon) {
+    for (const p of panels) p.obsLayer.clearLayers();
+    return;
+  }
+  try {
+    const { stations } = await fetchJSON(`/api/obs?lat=${siteLatLon[0]}&lon=${siteLatLon[1]}&radius_km=100`);
+    for (const p of panels) {
+      p.obsLayer.clearLayers();
+      for (const st of stations) {
+        const details = [];
+        if (st.dewpoint_f != null) details.push(`dewpoint ${st.dewpoint_f}&deg;F`);
+        if (st.humidity_pct != null) details.push(`${st.humidity_pct}% RH`);
+        if (st.wind_speed_mph != null) {
+          const gust = st.wind_gust_mph != null ? ` (gust ${st.wind_gust_mph})` : "";
+          details.push(`wind ${st.wind_speed_mph}mph${gust} @ ${st.wind_dir_deg ?? "?"}&deg;`);
+        }
+        if (st.pressure_inhg != null) details.push(`${st.pressure_inhg}"Hg`);
+        const popup = `<b>${st.id}</b> &middot; ${st.provider || ""}` +
+          (details.length ? `<br>${details.join("<br>")}` : "") +
+          (st.updated ? `<br><span style="opacity:.7">${st.updated} UTC</span>` : "");
+        L.marker([st.lat, st.lon], { icon: obsIcon(st.temp_f) })
+          .bindPopup(popup)
+          .addTo(p.obsLayer);
+      }
+    }
+  } catch (e) {
+    console.error("obs fetch failed", e);
   }
 }
 
@@ -1076,6 +1447,16 @@ siteSelect.addEventListener("change", (e) => switchSite(e.target.value));
 // cameras/alerts/NST/NMD overlays, which stay scoped to the default site
 // -- see renderPanelRadar's isDefaultSite comment for why.
 async function switchPanelSite(panel, newSite) {
+  // Single-pane: there's only one panel, so "set this panel" and "set
+  // the default all panels follow" are the same operation -- delegating
+  // to switchSite() keeps the top-right HUD selector and this panel's
+  // own toolbar/pill from ever disagreeing about what's on screen
+  // (found live 2026-09-24: they could drift apart, since only the HUD
+  // dropdown used to update the shared default). In grid mode this
+  // distinction is real (see switchSite's own comment) so only
+  // single-pane shortcuts to the bulk path.
+  if (panels.length === 1) return switchSite(newSite);
+
   panel.site = newSite;
   panel.siteSelect.value = newSite; // keep the dropdown in sync when the change came from clicking a pill instead
   panel.hasAutoFit = false;
@@ -1123,7 +1504,7 @@ async function tick() {
     // camera endpoint can take 1-3s on a cache miss, see
     // get_cameras()/CAMERA_CACHE_SEC in radar_lab.py) delayed everything
     // listed after it for no reason, every single tick.
-    await Promise.all([refreshCameras(), refreshAlerts(), refreshLevel3(), refreshMosaic()]);
+    await Promise.all([refreshCameras(), refreshAlerts(), refreshLevel3(), refreshMosaic(), refreshLightning(), refreshSnowplows(), refreshObs()]);
   } catch (e) {
     setStatus(`status error: ${e.message}`);
   }
@@ -1171,6 +1552,26 @@ nightToggle.addEventListener("click", () => {
   setNightMode(!document.body.classList.contains("night-mode"));
 });
 setNightMode(localStorage.getItem("radarLabNightMode") === "1");
+
+function downloadUrl(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+document.getElementById("download-marks-csv").addEventListener("click", () =>
+  downloadUrl("/api/marks/latest.csv", "pins.csv"));
+document.getElementById("download-marks-kml").addEventListener("click", () =>
+  downloadUrl("/api/marks/latest.kml", "marks.kml"));
+document.getElementById("clear-marks").addEventListener("click", () => {
+  if (!userMarks.pins.length && !userMarks.shapes.length) return;
+  if (!confirm("Clear all pins and shapes from the map? The already-saved file on disk isn't affected.")) return;
+  userMarks = { pins: [], shapes: [] };
+  marksSessionId = null; // next drawn item starts a fresh session file, doesn't overwrite the one just cleared
+  redrawUserMarks();
+});
 
 setLayout(1);
 loadCameraStateOptions();

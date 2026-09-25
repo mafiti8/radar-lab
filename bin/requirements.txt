@@ -4,3 +4,4 @@ numpy
 requests
 gps3
 Pillow
+netCDF4

@@ -402,6 +402,150 @@ requirement of the software itself.
   - **Real memory cost, not free**: see System requirements above --
     measured ~1.9GB with 3 different sites open at once, versus the old
     flat ~1GB single-site number.
+- **MADIS surface weather observations, built 2026-09-25** (`toggle-obs`
+  in the HUD, off by default): real-time temperature, dewpoint,
+  humidity, wind, and pressure from real weather stations -- not radar
+  data, station-level ground truth. Public "guest" access, no auth
+  needed, but took genuine trial and error to get right: the query needs
+  ~15 form parameters, and several reasonable-looking guesses were
+  simply wrong (`stasel="Y"` looked right from the field name but the
+  real default is a hidden field set to `"0"`; `rdr="metar"` looked
+  right but the page's own submit handler clears it to empty first) --
+  only found the true values by reading the guest page's actual HTML
+  form source line by line, not by guessing from field names or labels.
+  Verified live against a real Midwest bounding box: 729 distinct
+  stations, 4,677 observations, spanning genuinely different real
+  networks (ASOS airport stations, RAWS fire-weather stations, MesoWest,
+  citizen stations via APRSWXNET, marine/tide stations) -- confirms this
+  is a real aggregator, not one single network. Scoped near the active
+  radar site (asked for over a state picker) -- same bounding-box-
+  around-a-point shape as the near-site camera mode, computed server-
+  side and passed straight to MADIS's own native bbox query mode rather
+  than over-fetching and filtering client-side. Off by default since a
+  real bounding box can return several hundred stations at once, dense
+  enough to clutter the map before anyone's actually asked for it.
+- **Live snowplow truck tracking (Iowa), built 2026-09-25** (`toggle-
+  snowplows` in the HUD): real position tracking, not the periodic
+  dashcam photos above -- found while researching that feature, since
+  its publisher's org name already contained "AVL" (Automatic Vehicle
+  Location), a real hint that paid off. Public ArcGIS FeatureServer
+  (`AVL_Direct_View`), no auth, genuinely rich data: heading, speed,
+  road/air temperature, even material spread rates (salt/brine) and
+  individual plow blade states. Rendered as a heading-rotated triangle
+  marker (`snowplowIcon()`, CSS `rotate()` directly on the real compass
+  heading -- no offset correction needed since a "▲" glyph already
+  points north at 0deg, matching the heading convention).
+  - **Iowa only** -- Nebraska and Minnesota (same publisher, same photo-
+    feed pattern) checked and confirmed to only publish photos, not live
+    position. Indiana's own TrafficWise system (what prompted this
+    whole feature) isn't published as open data anywhere found -- same
+    kind of JS SPA as VA/TX turned out to be, a separate uncracked
+    investigation.
+  - **Real, honest limitation, not a bug**: the source itself only
+    reports trucks currently moving faster than 3mph -- a parked/idle
+    truck isn't "active" and won't appear. Confirmed live 2026-09-25
+    (September, no real winter operations) that the feed correctly
+    returns a valid empty result rather than erroring -- but this also
+    means the actual live truck data (real coordinates, a real heading
+    rotating the marker correctly, popup content) has **not been
+    visually verified this session** for the same reason mosaic/
+    lightning needed a real event to confirm -- worth checking again
+    once real snow operations are happening.
+- **Lightning (GOES-East + GOES-West GLM), built 2026-09-24 (West added
+  same day)**: real, free, near-
+  real-time flash detections -- verified live against `noaa-goes19`
+  (AWS S3, same no-auth-needed access pattern as everything else in this
+  app), ~17-60s real measured latency, new files every 20s. Flash-level
+  data only (lat/lon/energy), not the finer event/group hierarchy the
+  raw files also carry -- that's what `glmtools` is for, overkill for a
+  map overlay. `netCDF4` decodes it -- already an existing transitive
+  dependency (pulled in by MetPy/Py-ART), and unlike `pygrib` it has real
+  Windows wheels (verified 2026-09-24), so this is a hard dependency, not
+  an optional one. Server-side rolling window (`GLM_WINDOW_MINUTES`,
+  default 5min -- started at 15, cut down same day: real usage found an
+  active storm accumulates ~1,700 flashes in just 4 real minutes, so 15
+  minutes' worth turned into thousands of markers on screen, unreadable;
+  expiry/fade were both already correct, the window itself was just too
+  generous), filtered to a generous CONUS+margin bounding box before
+  shipping as raw JSON (full-disk coverage is mostly ocean/South
+  America, irrelevant here) -- verified live, ~72-102 real flashes per
+  satellite per 20s window in range. Markers fade (smaller/more
+  transparent) with age within that window so recent strikes read as
+  more prominent -- the frontend reads the actual window size from the
+  server's own response rather than hardcoding it a second time, so the
+  fade timing can't drift out of sync with the real server-side cutoff
+  the way a duplicated constant could.
+  - **GOES-West added same day**: identical instrument, different bucket
+    (`noaa-goes18`), same file format/cadence -- one poll thread now
+    handles both satellites sequentially each 20s cycle (small, fast
+    fetches, not worth a second thread). Confirmed live: GOES-West
+    already sees real flashes as far east as Arizona/New Mexico, fixing
+    the degraded-sensitivity gap GOES-East alone had toward the western
+    edge of its field of view. No deduplication between the two where
+    their coverage overlaps -- a real, accepted simplification (see the
+    code comment for why matching flashes across satellites isn't a
+    simple id/coordinate match). Verified live after doubling the decode
+    load: memory spiked to ~730MB right after restart (2x the netCDF4
+    decode work per cycle) then settled back to ~355MB and held stable
+    through several cycles -- the malloc_trim fix handles this the same
+    way it handled the single-satellite case.
+- **All GOES satellite products, built 2026-09-24** (was GOES-East IR/
+  Visible/GeoColor only): expanded to every product NASA GIBS actually
+  publishes for GOES-East *and* GOES-West, confirmed directly against
+  GIBS' own `WMTSCapabilities.xml` rather than assumed -- 6 products
+  (IR, Visible, GeoColor, Air Mass, Dust, Fire Temperature) times 2
+  satellites, all real, all checked live (real PNG tiles, not error
+  placeholders). New "Satellite" dropdown alongside the existing
+  product one. This same GOES-East/GOES-West pattern is exactly what
+  made adding GOES-West to the lightning feature (below) a same-day
+  follow-up rather than new architecture.
+- **Site indicator consistency fix, built 2026-09-24**: in single-pane
+  view, the top-right HUD "Radar site" dropdown could drift out of sync
+  with the panel's own toolbar dropdown / active site pill -- only the
+  HUD one updated the shared default site, so switching sites via the
+  panel's own control (or clicking a pill) left the HUD showing something
+  stale. Fixed: with exactly one panel, `switchPanelSite()` now just
+  delegates to the same bulk `switchSite()` path, since "set this panel"
+  and "set the shared default" are the same operation when there's only
+  one panel. In grid mode the two are genuinely different (panels can
+  legitimately show different sites) -- relabeled the HUD dropdown
+  "Radar site (all panels)" to make clear it's a bulk-apply action, not a
+  live readout of any one panel.
+- **Pins, shapes, and CSV/KML export, built 2026-09-24** (draw toolbar,
+  top-right of every panel's own map -- `leaflet-draw`): drop pins and
+  draw polygons/rectangles/polylines/circles directly on the map. One
+  shared set of pins/shapes across every panel (same "shared data drawn
+  into every panel's layer" pattern as cameras/alerts/NST/NMD) -- draw in
+  any panel, see it in all of them. Deliberately session-only, not
+  restored on reload (explicitly asked for) -- but every change
+  auto-saves (debounced 2s) to a timestamped file on the server
+  (`exports/marks_<session>.csv`/`.kml`) as a rolling backup, plus manual
+  "Pins (CSV)" / "All (KML)" download buttons in the HUD for grabbing the
+  latest save directly. KML (not CSV) is the real target for "export to
+  Google Maps" -- it's Google My Maps' native import format and is the
+  only one of the two that can carry shapes at all, not just points;
+  verified live: a real drawn polygon + circle + pin round-tripped
+  through `/api/marks/save` into valid KML with a correctly-closed
+  polygon ring and a circle approximated as a 36-point ring (KML has no
+  native circle primitive). CSV is pins only, matching what was actually
+  asked for there.
+- **Illinois camera images fixed, 2026-09-25** -- real referer-blocking
+  bug, not a dead data source. `cctv.travelmidwest.com` (859 of
+  Illinois's 1,334 cameras -- IDOT D1/D4, DuPage County, Kane County)
+  actively 403s any request whose Referer header isn't its own site,
+  which is exactly what a browser sends by default loading an `<img>`.
+  Confirmed live: the same URL returns 200 with no Referer at all but
+  403 with this page's own origin as Referer -- the backend's raw data
+  was always fine (99.7% of all 1,334 IL image URLs checked out live),
+  the images were only ever broken in a real browser. Fixed with
+  `referrerpolicy="no-referrer"` on the camera `<img>` tags (suppresses
+  the Referer header entirely for that request) -- covers every camera
+  image in the app, not just Illinois, so any other source with the
+  same hotlink-protection habit is fixed for free too. Indiana and
+  Wisconsin cameras mostly route through different hosts
+  (`content.trafficwise.org`, `511wi.gov`) that don't have this
+  restriction, which is why this specifically read as an Illinois-only
+  problem even though the fix isn't Illinois-specific.
 - **Camera images auto-refresh + fullscreen lightbox, built 2026-09-24**:
   snapshot URLs are "latest image" endpoints on the source's own server
   -- the URL string itself never changes when a new frame is captured,
@@ -462,15 +606,62 @@ requirement of the software itself.
     genuinely co-located DOT cameras. Fixed by spreading each camera
     onto a small ring (~2km) around its volcano's summit. Verified live:
     31 distinct clickable markers, zero collisions.
-  - **Still not resolved**: Virginia, Texas, Alabama, Mississippi. All
-    four are JS-rendered single-page apps, not plain server-rendered
-    pages -- a curl of the page HTML returns little or no real content.
-    Virginia's Angular bundle (`main-FVQ2IQQK.js`) confirms a real
-    `cameraFeed`/`cameraId` component exists client-side, but the actual
-    backend API URL that populates it wasn't found by searching the
-    bundle for literal `https://` strings -- it's likely built
-    dynamically rather than hardcoded. Real attempts made, not just
-    skipped; genuinely unresolved.
+  - **Virginia added 2026-09-25** (1,679 grouped cameras): its own
+    fourth distinct platform ("iLog"), found by downloading and grepping
+    all 46 of the Angular app's lazy-loaded JS chunks (the main bundle
+    alone didn't have it) for the real `getCamerasArray()` call --
+    `BASE_URL+"/array/cameras"`, same-origin on `511.vdot.virginia.gov`
+    itself via a relative config path (`NODE_ENDPOINT.foo`), not a
+    third-party host. Verified live: real image URLs, real 200
+    `image/png` responses.
+  - **Mississippi added 2026-09-25** (456 cameras): a fifth platform --
+    an older ASP.NET WebForms site (not a SPA), found via its classic
+    `ScriptManager` "PageMethods" pattern (`Default.aspx/LoadCameraData`,
+    POST an empty JSON body). That one request gives coordinates for all
+    456 cameras, but not image URLs -- those only exist inside each
+    camera's own iframe "bubble" page
+    (`mapbubbles/camerasite.aspx?site=N`), fetched individually,
+    parallelized (`ThreadPoolExecutor(max_workers=10)`, same pattern as
+    the DataTables states' pagination). Real measured cost: ~14-18s for
+    the full state on a cache miss.
+  - **Texas added 2026-09-25, but currently non-functional** (3,433
+    grouped cameras): a sixth platform, MapLarge (a commercial GIS data
+    vendor) -- found by locating the real `table/query` request object
+    TxDOT's own map-click handler builds
+    (`Api/ProcessDirect?request={"action":"table/query","query":{...
+    "table":"appgeo/cameraPoint"...}}`). Real coordinates for all 3,491
+    cameras, but **no static snapshot image exists at all** here --
+    `imageurl` in the raw data is a dead `https://localhost/...`
+    placeholder, confirmed broken, not just untested. The only real
+    media is `httpsurl`, a tokenized HLS live stream -- added real video
+    playback for this (`hls.js`, native on Safari/iOS, per-panel
+    popupopen/popupclose wiring to start/stop streams), the one state
+    that needed it.
+    - **Real, current problem found by testing, not assumed**: decoded
+      a live token and found it already expired; sampled 200 different
+      cameras and found *all 200* already expired regardless of how
+      fast they were re-fetched. Traced into TxDOT's own app code and
+      confirmed their production frontend uses this exact same
+      `httpsurl` field directly as the video source, with no separate
+      fresh-token endpoint anywhere in the bundle -- meaning
+      drivetexas.org's own cameras are very likely showing the same
+      broken video right now, not something specific to this
+      integration. This looks like a stale token-refresh job on
+      TxDOT/MapLarge's side, outside radar-lab's control to fix. Cache
+      TTL shortened to 60s for TX specifically (the underlying query is
+      fast, ~0.4s for all 3,491) so a real upstream refresh gets picked
+      up quickly if/when it happens -- but as of this writing, clicking
+      a Texas camera will most likely show a broken player, not a live
+      stream. The architecture is correct and will start working the
+      moment TxDOT's own data is fresh again.
+  - **Still not resolved**: Alabama. Confirmed the real per-camera
+    image pattern works (`api.algotraffic.com/v3/Cameras/{id}/
+    snapshot.jpg` returns real JPEGs), but after substantial digging
+    could not find the actual "list all cameras" endpoint -- the
+    obvious collection route 404s even with browser-like headers, and a
+    related `/Devices` route requires a logged-in session (real
+    OAuth/PKCE flow found in the bundle). Genuinely stuck, not a quick
+    fix; real attempts made.
 - **National radar mosaic, built 2026-09-23** (`toggle-mosaic` in the
   HUD, off by default): NOAA's own pre-merged national composite --
   MRMS `MergedReflectivityQCComposite`, all ~160 WSR-88D sites already

@@ -3,3 +3,4 @@ data/*.bin
 __pycache__/
 *.pyc
 .env
+exports/
