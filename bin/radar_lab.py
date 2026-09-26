@@ -20,6 +20,7 @@ client-side rendering the way single-site data works. "Server-side" here
 still just means this same process, on whatever machine runs it (today
 homehub, eventually the field laptop) -- not a separate remote service.
 """
+import contextlib
 import csv
 import ctypes
 import datetime as dt
@@ -32,6 +33,7 @@ import math
 import os
 import re
 import tempfile
+import sys
 import threading
 import time
 import urllib.error
@@ -72,8 +74,23 @@ except ImportError:
     netCDF4 = None
     LIGHTNING_AVAILABLE = False
 
-BASE = Path(__file__).resolve().parent.parent
-WEB_DIR = BASE / "web"
+# Packaging prep, 2026-09-25 -- a PyInstaller-frozen build (the real
+# "two-click install" target) extracts its bundled read-only files
+# (web/) to a temp directory (sys._MEIPASS) that's wiped after the
+# process exits. Writable state -- .env (site config) and exports/
+# (saved pins/shapes) -- must NOT live there, or every single run would
+# silently lose its config and any saved work. Writable state goes next
+# to the actual .exe instead, so it persists exactly the way it already
+# does for a plain source checkout (where .env/exports/ both live at the
+# project root). Not frozen (the normal source/dev case): both are the
+# same directory, same as before this existed.
+if getattr(sys, "frozen", False):
+    BASE = Path(sys.executable).resolve().parent  # writable: .env, exports/
+    ASSETS_BASE = Path(sys._MEIPASS)  # read-only: bundled web/ files
+else:
+    BASE = Path(__file__).resolve().parent.parent
+    ASSETS_BASE = BASE
+WEB_DIR = ASSETS_BASE / "web"
 # User-drawn pins/shapes auto-save here (2026-09-24) -- deliberately NOT
 # restored into the live map on reload (the ask was "session only"), but
 # each session's work still lands on disk as its own timestamped file
@@ -151,6 +168,32 @@ def release_decode_memory():
     gc.collect()
     if _libc is not None:
         _libc.malloc_trim(0)
+
+
+@contextlib.contextmanager
+def temp_file_for(raw: bytes, suffix: str = ""):
+    """Windows prep, 2026-09-25 -- every decode path in this app (Py-ART,
+    MetPy, pygrib, netCDF4) writes raw bytes to a temp file, then hands
+    the file's *path* to a separate library to open on its own. The
+    obvious `with tempfile.NamedTemporaryFile() as f: f.write(...);
+    <library>.open(f.name)` pattern works on Linux/Mac but is a real,
+    documented Windows failure -- Python's own tempfile docs say
+    directly that a NamedTemporaryFile's name isn't usable to reopen the
+    file a second time while the first handle is still open, on Windows
+    specifically (something else trying to open it hits a real
+    PermissionError there). Fix: delete=False + close the handle before
+    anything else touches the path, clean up in a finally block since
+    delete=False means nothing does that automatically anymore. Found by
+    code review while prepping for a real Windows test, not discovered
+    by a failed run -- would have broken radar decode, lightning decode,
+    and mosaic decode all at once there."""
+    f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        f.write(raw)
+        f.close()
+        yield f.name
+    finally:
+        os.unlink(f.name)
 
 
 # ---------------------------------------------------------------------------
@@ -251,10 +294,8 @@ def decode_level2(raw: bytes, site: str, tilt_index: int = 0) -> dict:
     to decode (0 = lowest, matching the original V1 behavior before tilt
     selection existed) -- see list_tilts(). Added 2026-09-23.
     """
-    with tempfile.NamedTemporaryFile(suffix="_V06") as f:
-        f.write(raw)
-        f.flush()
-        radar = pyart.io.read_nexrad_archive(f.name)
+    with temp_file_for(raw, suffix="_V06") as path:
+        radar = pyart.io.read_nexrad_archive(path)
 
     # Many VCPs "split cut" some elevations (almost always the lowest
     # few) into two sweeps at the *same* angle: a long-pulse
@@ -334,10 +375,8 @@ def serialize_field(scan: dict, internal_key: str) -> list[list[float | None]] |
 def decode_level3(raw: bytes, site: str) -> dict:
     from metpy.io import Level3File
 
-    with tempfile.NamedTemporaryFile() as f:
-        f.write(raw)
-        f.flush()
-        f3 = Level3File(f.name)
+    with temp_file_for(raw) as path:
+        f3 = Level3File(path)
 
     out = {
         "product": getattr(f3, "product_name", "?"),
@@ -358,6 +397,110 @@ def decode_level3(raw: bytes, site: str) -> dict:
                     text = item[2] if len(item) > 2 else ""
                     out["points"].append({"x_km": x, "y_km": y, "text": str(text)})
     return out
+
+
+# Level III radial products, built 2026-09-25 -- Storm Relative Velocity
+# (N0S), Digital VIL (DVL), Enhanced Echo Tops (EET), Hydrometeor
+# Classification (HHC), 1-Hour Precipitation (OHA). Found by listing every
+# real product NOAA actually publishes for a real site (100 distinct
+# codes) rather than guessing which exist -- most of that 100 turned out
+# to be per-tilt repeats of moments already available from Level II
+# (reflectivity/velocity/etc at each elevation, already covered by tilt
+# selection), or currently-dormant alert products (no active severe
+# weather right now). These five are the real, currently-decodable,
+# genuinely new ones that fit this app's severe-weather scope.
+#
+# Confirmed live these use the *same* azimuth/range radial shape as the
+# existing Level II products (not the x/y raster grid Composite
+# Reflectivity turned out to use) -- so they reuse the existing
+# client-side RadarTileLayer renderer as just more product choices,
+# verified field-by-field against a real decoded file rather than assumed
+# from the product family name alone.
+LEVEL3_RADIAL_PRODUCTS = {
+    # endpoint name -> (real NEXRAD product code, response JSON key)
+    "storm_relative_velocity": ("N0S", "srv_ms"),
+    "vil": ("DVL", "vil_kgm2"),
+    "echo_tops": ("EET", "echo_tops_kft"),
+    "hydrometeor_class": ("HHC", "hc_code"),
+    "precip_1h": ("OHA", "precip_in"),
+}
+
+
+def decode_level3_radial(raw: bytes, site: str, resp_key: str) -> dict:
+    from metpy.io import Level3File
+
+    with temp_file_for(raw) as path:
+        f3 = Level3File(path)
+    item = f3.sym_block[0][0]
+    data = f3.map_data(np.asarray(item["data"]))
+    if isinstance(data, tuple):
+        # Echo Tops (EET) specifically returns (values, is_below_radar_
+        # coverage_flag) instead of a plain array -- found live
+        # 2026-09-25, not documented anywhere obvious. The flag is real
+        # (distinguishes a directly-measured top from one estimated
+        # beyond the radar's vertical coverage) but not worth surfacing
+        # as a separate field for a first pass -- just the height values.
+        data = data[0]
+    return {
+        "site": site,
+        "lat": f3.lat,
+        "lon": f3.lon,
+        "azimuths": [round(float(a), 1) for a in item["start_az"]],
+        # gate_scale/first are real km values (confirmed live: gate_scale
+        # * ngates matches the file's own max_range) -- *1000 for meters,
+        # matching the convention every other radial product in this app
+        # already uses.
+        "gate0_m": float(item["first"]) * 1000,
+        "gate_step_m": float(item["gate_scale"]) * 1000,
+        "ngates": data.shape[1],
+        resp_key: [[None if np.isnan(v) else round(float(v), 2) for v in row] for row in data],
+    }
+
+
+def decode_and_render_composite(raw: bytes, site: str) -> tuple[bytes, list]:
+    """Site-level Composite Reflectivity (NCR) -- NOAA's own precomputed
+    'maximum reflectivity across every tilt' field, not something
+    recomputed here from raw Level II tilts (NOAA already does the real
+    geometric work of combining tilts of different resolution correctly;
+    redoing that would be a lot of work for a worse result). Real x/y
+    raster grid (not radial -- confirmed live, unlike the products
+    above), so this renders server-side to a PNG, same approach and same
+    DBZ_STOPS color table as the national mosaic, for visual consistency
+    between the two."""
+    from metpy.io import Level3File
+
+    with temp_file_for(raw) as path:
+        f3 = Level3File(path)
+    item = f3.sym_block[0][0]
+    data = f3.map_data(np.asarray(item["data"]))
+    if isinstance(data, tuple):
+        # Echo Tops (EET) specifically returns (values, is_below_radar_
+        # coverage_flag) instead of a plain array -- found live
+        # 2026-09-25, not documented anywhere obvious. The flag is real
+        # (distinguishes a directly-measured top from one estimated
+        # beyond the radar's vertical coverage) but not worth surfacing
+        # as a separate field for a first pass -- just the height values.
+        data = data[0]
+
+    h, w = data.shape
+    rgba = np.zeros((h, w, 4), dtype="uint8")
+    valid = ~np.isnan(data) & (data >= 5)
+    for threshold, color in DBZ_STOPS:
+        mask = valid & (data >= threshold)
+        rgba[mask, 0], rgba[mask, 1], rgba[mask, 2], rgba[mask, 3] = *color, 200
+
+    img = Image.fromarray(rgba, "RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+
+    # Bounds: a square grid centered on the site, spanning max_range km in
+    # each direction -- confirmed live (464x464 grid, max_range=230km ->
+    # ~0.99km/pixel, consistent with a square +/-max_range extent), same
+    # flat-local-plane approximation already used elsewhere in this app
+    # (hazcam ring offsets, MADIS bounding boxes).
+    south, west, north, east = bbox_from_radius(f3.lat, f3.lon, f3.max_range)
+    bounds = [[south, west], [north, east]]
+    return buf.getvalue(), bounds
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +528,22 @@ class Cache:
         # V1 scope limit, not an oversight.
         self.latest_raw_l2: tuple[str, bytes] | None = None  # (ts, raw)
         self.tilt_cache: dict[int, dict] = {}  # tilt_index -> decoded, latest scan only
+        # Level III radial products (2026-09-25) -- Storm Relative
+        # Velocity, Digital VIL, Echo Tops, Hydrometeor Classification,
+        # 1-Hour Precipitation. Same azimuth/range radial shape as the
+        # Level II products above (found live -- NOT the same x/y raster
+        # shape Composite Reflectivity turned out to use), so these reuse
+        # the existing client-side RadarTileLayer renderer as just more
+        # product choices, instead of needing image rendering like the
+        # composite/mosaic do.
+        self.level3_radial: dict[str, dict] = {}  # product code -> decoded radial dict
+        # Composite Reflectivity (NCR) -- the one Level III product here
+        # that really is an x/y raster grid, not radial -- rendered
+        # server-side to a PNG per site, same reasoning as the national
+        # mosaic (too different a shape for the radial tile renderer).
+        self.composite_png: bytes | None = None
+        self.composite_bounds: list | None = None
+        self.composite_updated: str | None = None
 
     def add_scan(self, ts: str, data: dict, raw: bytes):
         with self.lock:
@@ -434,6 +593,24 @@ class Cache:
     def get_level3(self, product: str) -> dict | None:
         with self.lock:
             return self.level3.get(product)
+
+    def set_level3_radial(self, product_code: str, data: dict):
+        with self.lock:
+            self.level3_radial[product_code] = data
+
+    def get_level3_radial(self, product_code: str) -> dict | None:
+        with self.lock:
+            return self.level3_radial.get(product_code)
+
+    def set_composite(self, png: bytes, bounds: list):
+        with self.lock:
+            self.composite_png = png
+            self.composite_bounds = bounds
+            self.composite_updated = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    def get_composite(self) -> tuple[bytes | None, list | None, str | None]:
+        with self.lock:
+            return self.composite_png, self.composite_bounds, self.composite_updated
 
 class MosaicCache:
     """Separate from the per-site Cache class (2026-09-24 multi-site
@@ -525,7 +702,16 @@ def poll_site_loop(site: str, cache: Cache):
     eviction, since that happens directly in get_cache(), not signaled
     here)."""
     last_l2_key = None
-    last_l3_key = {"NST": None, "NMD": None}
+    # NHI (Hail Index) and NTV (Tornadic Vortex Signature) added
+    # 2026-09-25 -- same point/graphic-page product family as NST/NMD
+    # (decode_level3() already handles this shape generically), so this
+    # is just two more product codes in the same loop, not new decode
+    # logic. Both are real products that are legitimately empty/dormant
+    # whenever there's no active severe weather to detect -- same as
+    # NST/NMD already were on a quiet day, not a bug.
+    last_l3_key = {"NST": None, "NMD": None, "NHI": None, "NTV": None}
+    last_l3_radial_key = {code: None for code, _ in LEVEL3_RADIAL_PRODUCTS.values()}
+    last_composite_key = None
     while True:
         with _caches_lock:
             if _caches.get(site) is not cache:
@@ -552,7 +738,7 @@ def poll_site_loop(site: str, cache: Cache):
             cache.status["last_error"] = f"level2: {e}"
             print(f"[radar-lab] level2 poll error ({site}): {e}")
 
-        for product in ("NST", "NMD"):
+        for product in ("NST", "NMD", "NHI", "NTV"):
             try:
                 key = latest_level3_key(site, product)
                 if key and key != last_l3_key[product]:
@@ -564,6 +750,33 @@ def poll_site_loop(site: str, cache: Cache):
             except Exception as e:  # noqa: BLE001
                 cache.status["last_error"] = f"{product}: {e}"
                 print(f"[radar-lab] level3 {product} poll error ({site}): {e}")
+
+        for endpoint_name, (product_code, resp_key) in LEVEL3_RADIAL_PRODUCTS.items():
+            try:
+                key = latest_level3_key(site, product_code)
+                if key and key != last_l3_radial_key[product_code]:
+                    raw = s3_fetch(L3_BUCKET, key)
+                    decoded = decode_level3_radial(raw, site, resp_key)
+                    cache.set_level3_radial(product_code, decoded)
+                    last_l3_radial_key[product_code] = key
+                    print(f"[radar-lab] new level3 {product_code} ({site}): {key}")
+                    release_decode_memory()
+            except Exception as e:  # noqa: BLE001
+                cache.status["last_error"] = f"{product_code}: {e}"
+                print(f"[radar-lab] level3 {product_code} poll error ({site}): {e}")
+
+        try:
+            key = latest_level3_key(site, "NCR")
+            if key and key != last_composite_key:
+                raw = s3_fetch(L3_BUCKET, key)
+                png, bounds = decode_and_render_composite(raw, site)
+                cache.set_composite(png, bounds)
+                last_composite_key = key
+                print(f"[radar-lab] new composite reflectivity ({site}): {key}")
+                release_decode_memory()
+        except Exception as e:  # noqa: BLE001
+            cache.status["last_error"] = f"NCR: {e}"
+            print(f"[radar-lab] composite poll error ({site}): {e}")
 
         cache.status["last_poll"] = dt.datetime.now(dt.timezone.utc).isoformat()
         time.sleep(POLL_INTERVAL_SEC)
@@ -604,10 +817,8 @@ def decode_and_render_mosaic(raw_gz: bytes) -> tuple[bytes, list]:
     a Leaflet imageOverlay. Real measured cost 2026-09-23: ~6.5s decode +
     ~2.3s vectorized colorize + ~0.4s resize/encode, ~9-10s total."""
     raw = gzip.decompress(raw_gz)
-    with tempfile.NamedTemporaryFile(suffix=".grib2") as f:
-        f.write(raw)
-        f.flush()
-        grbs = pygrib.open(f.name)
+    with temp_file_for(raw, suffix=".grib2") as path:
+        grbs = pygrib.open(path)
         grb = grbs[1]
         data, lats, lons = grb.data()
         missing = grb.missingValue
@@ -726,10 +937,8 @@ def latest_glm_key(bucket: str) -> str | None:
 
 
 def decode_glm_flashes(raw: bytes, satellite_label: str) -> list[dict]:
-    with tempfile.NamedTemporaryFile(suffix=".nc") as f:
-        f.write(raw)
-        f.flush()
-        ds = netCDF4.Dataset(f.name)
+    with temp_file_for(raw, suffix=".nc") as path:
+        ds = netCDF4.Dataset(path)
         try:
             # netCDF4 auto-applies each variable's scale_factor/add_offset
             # (confirmed live 2026-09-24 against a real file) -- these come
@@ -1140,13 +1349,54 @@ STATE_DATATABLES_DOMAINS = {
     "LA": "511la.org",
     "PA": "511pa.com",
     "NC": "www.drivenc.gov",
+    "NY": "511ny.org",
+    "AZ": "www.az511.gov",
+    # Real vendor name found 2026-09-25 while chasing Massachusetts:
+    # "CARS Program" / Castle Rock ITS runs this same DataTables platform
+    # across a real nationwide list of states (found via mass511.com's
+    # own bundle referencing 511ny.org, cttravelsmart.org, az511.gov,
+    # cotrip.org, 511ia.org, kandrive.org, nmroads.com, and more as
+    # sibling deployments) -- FL/GA/LA/PA/NC/NY were each found
+    # independently before this; AZ and CT are the first two confirmed
+    # *because* of that shared-vendor list, not independently guessed.
+    "CT": "ctroads.org",  # cttravelsmart.org (CT's own public-facing domain) redirects here -- this is the real API host, confirmed live
+    # Real upgrade, not just an addition: 511wi.gov (this platform) has
+    # 490 real cameras vs. the previous TravelMidwest-sourced 263 for the
+    # same state -- switched WI here instead of adding it as a second,
+    # smaller source alongside a better one.
+    "WI": "511wi.gov",
+    # Same platform again, found 2026-09-26 -- this generation is really
+    # IBI Group's "ibi511" product (the same platform behind
+    # prod-ut.ibi511.com / prod-nv.ibi511.com's separate *keyed*
+    # developer API), not just "CARS Program" -- turns out the two
+    # vendors' public-facing sites share this exact DataTables backend
+    # shape. Found by testing the known `/List/GetData/Cameras` endpoint
+    # directly against every remaining un-sourced state's likely domain
+    # rather than digging through another bundle -- three hits with zero
+    # new parsing code needed, `fetch_datatables_cameras` already handles
+    # this shape as-is.
+    "UT": "udottraffic.utah.gov",  # 2,081 real cameras
+    "NV": "www.nvroads.com",  # 652 real cameras
+    "ID": "511.idaho.gov",  # 457 real cameras
+    "AK": "511.alaska.gov",  # 130 real cameras
 }
-# IN/IL/WI all come from one shared multi-state feed (see
+# IN/IL all come from one shared multi-state feed (see
 # fetch_travelmidwest_cameras) -- filtered by id prefix per state here.
-TRAVELMIDWEST_STATES = {"IN", "IL", "WI"}
+# WI moved to STATE_DATATABLES_DOMAINS above (511wi.gov) 2026-09-25 -- a
+# real upgrade (490 cameras vs. 263 from this source), not redundant.
+TRAVELMIDWEST_STATES = {"IN", "IL"}
+# Same DataTables platform as STATE_DATATABLES_DOMAINS above, but one
+# domain covering multiple states at once (see fetch_datatables_cameras's
+# state_code=None mode) -- confirmed live 2026-09-25, all 406 real
+# records checked, no areaId besides these three present. Massachusetts/
+# Rhode Island/Connecticut were checked against several likely domains
+# and none matched this platform -- not part of this feed, not yet found
+# on another one either.
+NEWENGLAND_DOMAIN = "newengland511.org"
+NEWENGLAND_STATES = {"NH", "ME", "VT"}
 
 
-def fetch_datatables_cameras(domain: str, state_code: str, page_size: int = 100, max_pages: int = 60) -> list[dict]:
+def fetch_datatables_cameras(domain: str, state_code: str | None, page_size: int = 100, max_pages: int = 60) -> list[dict]:
     """Generic fetcher for the shared 511-platform camera API. Server
     enforces a 100-per-page cap regardless of what's requested
     (confirmed live 2026-09-24 -- asking for length=10000 on Florida's
@@ -1155,7 +1405,15 @@ def fetch_datatables_cameras(domain: str, state_code: str, page_size: int = 100,
     (~0.5-0.6s/page measured); parallelized across a thread pool like
     the two-source camera fetch already does, real time drops to a few
     seconds. max_pages is a hard safety cap (6000 cameras' worth), not
-    expected to actually bind for any current source."""
+    expected to actually bind for any current source.
+
+    state_code=None (2026-09-25, for newengland511.org): some domains on
+    this platform cover *multiple* states from one shared feed instead
+    of one state each -- confirmed live for New England (NH/ME/VT, all
+    406 records checked, no other values present) via each row's own
+    "areaId" field, not a fixed per-domain state the way every other
+    DataTables source here works. None means "use each row's own areaId
+    instead of a fixed state_code"."""
     base = f"https://{domain}"
 
     def fetch_page(start: int) -> dict:
@@ -1167,8 +1425,20 @@ def fetch_datatables_cameras(domain: str, state_code: str, page_size: int = 100,
                 "Content-Type": "application/x-www-form-urlencoded",
             },
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read())
+        # One retry, not zero -- found live 2026-09-25 that 511ny.org
+        # specifically 500s on a real but inconsistent fraction of the
+        # ~19 concurrent page requests a state its size needs (different
+        # pages failed on repeated runs, not the same ones -- genuinely
+        # transient/rate-limiting, not a real permanent error). A single
+        # retry recovered every failure seen in testing.
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    return json.loads(resp.read())
+            except Exception:
+                if attempt == 1:
+                    raise
+                time.sleep(0.5)
 
     first = fetch_page(0)
     total = first.get("recordsTotal", 0)
@@ -1194,12 +1464,13 @@ def fetch_datatables_cameras(domain: str, state_code: str, page_size: int = 100,
         if not point:
             continue
         lon, lat = point
+        row_state = state_code or row.get("areaId") or "?"
         roadway, direction = row.get("roadway"), row.get("direction")
         name = f"{roadway} {direction}".strip() if roadway else (row.get("location") or f"Camera {row.get('id')}")
         out.append({
-            "id": f"{state_code}-{row.get('id')}",
+            "id": f"{row_state}-{row.get('id')}",
             "name": name,
-            "src": row.get("source") or state_code,
+            "src": row.get("source") or row_state,
             "age": None,
             "lat": lat,
             "lon": lon,
@@ -1282,6 +1553,10 @@ def fetch_hazcams() -> list[dict]:
 STATE_ITERIS_GEOJSON_URLS = {
     "SC": "https://sc.cdn.iteris-atis.com/geojson/icons/metadata/icons.cameras.geojson",
 }
+STATE_ITERIS_MULTICAM_GEOJSON_URLS = {
+    "MT": "https://mt.cdn.iteris-atis.com/geojson/icons/metadata/icons.cameras.geojson",
+    "SD": "https://sd.cdn.iteris-atis.com/geojson/icons/metadata/icons.cameras.geojson",
+}
 
 
 def fetch_iteris_cameras(url: str, state_code: str) -> list[dict]:
@@ -1308,6 +1583,44 @@ def fetch_iteris_cameras(url: str, state_code: str) -> list[dict]:
             "lon": lon,
             "snapshot": image_url,
         })
+    return out
+
+
+# Montana and South Dakota are on the same Iteris ATIS vendor as South
+# Carolina (`{state}.cdn.iteris-atis.com/geojson/...`, found 2026-09-26
+# by brute-forcing the same URL pattern with every state's 2-letter code
+# -- only these two plus SC answered with real data) but a distinct,
+# older-looking schema: each site feature holds a real `cameras` array
+# (one entry per physical view -- e.g. north/south/road-surface at the
+# same pole), not one flat `image_url` per feature like SC. Both real:
+# 38 sites/38 cameras for MT, 40 sites/173 cameras for SD -- small,
+# genuinely rural-interstate camera counts, not a partial/broken feed.
+def fetch_iteris_multicam_cameras(url: str, state_code: str) -> list[dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        coords = (feat.get("geometry") or {}).get("coordinates")
+        if not coords:
+            continue
+        lon, lat = coords[0], coords[1]
+        route = props.get("route")
+        site_id = props.get("id") or feat.get("id")
+        for cam in props.get("cameras", []):
+            image_url = cam.get("image")
+            if not image_url:
+                continue
+            out.append({
+                "id": f"{state_code}-{site_id}-{cam.get('id')}",
+                "name": cam.get("description") or cam.get("name") or f"Camera {cam.get('id')}",
+                "src": route or state_code,
+                "age": None,
+                "lat": lat,
+                "lon": lon,
+                "snapshot": image_url,
+            })
     return out
 
 
@@ -1349,6 +1662,497 @@ def fetch_va_cameras() -> list[dict]:
             "lat": lat,
             "lon": lon,
             "snapshot": image_url,
+        })
+    return out
+
+
+# Rhode Island runs a fifth distinct platform: the actual data lives in
+# a real, public Esri ArcGIS FeatureServer layer, found 2026-09-26 by
+# tracing the interactive camera map (`dot.ri.gov/travel/
+# traffic_camera_map/`, redirected from the plain camera-gallery pages
+# which are themselves just static per-region HTML with hardcoded
+# <img> tags and no coordinates at all) into its own JS module, which
+# constructs a `FeatureLayer` pointed at
+# `risegis.ri.gov/hosting/rest/services/RIDOT/Rhodeways/MapServer/6` --
+# a standard, documented ArcGIS REST query endpoint, not a custom API
+# needing further reverse-engineering. Real, clean data: 143 features,
+# each with WGS84 `Latitude`/`Longitude` fields already present on the
+# attributes (no geometry reprojection needed even though the
+# `geometry` block itself is in RI State Plane) and a direct
+# `CCVEWebURL` snapshot field -- confirmed live as a real 200
+# image/jpeg.
+RI_CAMERAS_URL = (
+    "https://risegis.ri.gov/hosting/rest/services/RIDOT/Rhodeways/MapServer/6/query"
+    "?where=1%3D1&outFields=*&f=json&returnGeometry=false"
+)
+
+
+def fetch_ri_cameras() -> list[dict]:
+    req = urllib.request.Request(RI_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        lat, lon = attrs.get("Latitude"), attrs.get("Longitude")
+        image_url = attrs.get("CCVEWebURL")
+        if not lat or not lon or not image_url:
+            continue
+        out.append({
+            "id": f"RI-{attrs.get('EquipmentID')}",
+            "name": attrs.get("Description") or f"Camera {attrs.get('EquipmentID')}",
+            "src": "RIDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# Maryland's CHART system exposes camera *locations* through a public
+# ArcGIS FeatureServer too (`mdgeodata.md.gov/imap/rest/services/
+# Transportation/MD_TrafficCameras`), but its own `url` field there is
+# just an HTML player page, not a usable image/stream link -- a step
+# short of actually usable, same shape as Mississippi's per-camera
+# bubble pages. Found the real source instead by searching for CHART's
+# own JSON feed directly: `chart.maryland.gov/DataFeeds/GetCamerasJson`,
+# a plain JSON array (552 cameras) whose `publicVideoURL` is itself
+# another HTML player page (`/Video/GetVideo/{id}`) -- one more layer
+# in, that page's own inline script builds the real HLS URL from two
+# fields already present in the JSON (`https://{cctvIp}/rtplive/{id}/
+# playlist.m3u8`), so the wrapper page never actually needs fetching.
+# Confirmed live and playable (`#EXTM3U`, real HLS manifest) -- Maryland
+# gets real working video, unlike Texas's expired-token problem, using
+# the same hls.js wiring already built for TX.
+MD_CAMERAS_URL = "https://chart.maryland.gov/DataFeeds/GetCamerasJson"
+
+
+def fetch_md_cameras() -> list[dict]:
+    req = urllib.request.Request(MD_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rows = json.loads(resp.read())
+    out = []
+    for row in rows:
+        lat, lon = row.get("lat"), row.get("lon")
+        cctv_ip, cam_id = row.get("cctvIp"), row.get("id")
+        if not lat or not lon or not cctv_ip or not cam_id:
+            continue
+        out.append({
+            "id": f"MD-{cam_id}",
+            "name": row.get("description") or row.get("name") or f"Camera {cam_id}",
+            "src": "MDOT CHART",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "stream": f"https://{cctv_ip}/rtplive/{cam_id}/playlist.m3u8",
+        })
+    return out
+
+
+# Washington's real camera map (a Vue/Vite SPA, `wsdot.com/Travel/
+# Real-time/Map/`) loads its ArcGIS FeatureLayer URL from a runtime
+# config object never present as a literal string anywhere in its own
+# JS bundle -- unlike Rhode Island, grepping the bundle for the actual
+# endpoint came up empty. Found instead by going straight to WSDOT's
+# own public ArcGIS Server (`data.wsdot.wa.gov/arcgis/rest/services`,
+# same domain also used for exactly this per-state pattern) and
+# browsing its real folder listing: a `TravelInformation` folder holds
+# `TravelInfoCamerasWeather`, whose name alone confirmed it before even
+# querying it. Real, clean data: 1,705 features via a single query with
+# `outSR=4326` (skips a manual Web-Mercator-to-WGS84 reprojection
+# entirely -- ArcGIS reprojects server-side when asked), confirmed live
+# as a real 200 image/jpeg. Includes some real cross-border cameras
+# (Oregon's own tripcheck.com feed appears for shared I-5 crossings) --
+# not a data-quality issue, WSDOT's own feed does the same.
+WA_CAMERAS_URL = (
+    "https://data.wsdot.wa.gov/arcgis/rest/services/TravelInformation/TravelInfoCamerasWeather/FeatureServer/0/query"
+    "?where=1%3D1&outFields=*&f=json&returnGeometry=true&outSR=4326"
+)
+
+
+def fetch_wa_cameras() -> list[dict]:
+    req = urllib.request.Request(WA_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry") or {}
+        lon, lat = geom.get("x"), geom.get("y")
+        image_url = attrs.get("ImageURL")
+        if lon is None or lat is None or not image_url:
+            continue
+        out.append({
+            "id": f"WA-{attrs.get('OBJECTID')}",
+            "name": attrs.get("CameraTitle") or f"Camera {attrs.get('OBJECTID')}",
+            "src": "WSDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# California is the one state this session where the *documented,
+# official* public API turned out to be the easiest route rather than
+# reverse-engineering an SPA -- Caltrans's CWWP2 ("Commercial Wholesale
+# Web Portal") publishes real per-district CCTV status JSON
+# (`cwwp2.dot.ca.gov/data/{d1..d12}/cctv/cctvStatus{D01..D12}.json`,
+# zero-padded past D9 but not before it -- a real inconsistency in
+# their own filenames, not a typo here), no API key needed, found from
+# Caltrans's own public documentation page for it
+# (`cwwp2.dot.ca.gov/documentation/cctv/cctv.htm`). Each camera record
+# carries both a real static `currentImageURL` (still image) and a real
+# `streamingVideoURL` (HLS m3u8) -- both included here rather than
+# picking one, since group_cameras_by_location already treats
+# snapshots/streams as independent per-camera lists. 12 separate
+# district requests are needed (no single statewide endpoint exists);
+# real combined count confirmed live: 3,591 cameras, by far the largest
+# single state found this session.
+CA_CWWP2_DISTRICTS = [(n, f"D{n:02d}") for n in range(1, 13)]
+
+
+def fetch_ca_cameras() -> list[dict]:
+    def fetch_district(dnum: int, dsuffix: str) -> list[dict]:
+        url = f"https://cwwp2.dot.ca.gov/data/d{dnum}/cctv/cctvStatus{dsuffix}.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read()).get("data", [])
+
+    out = []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(fetch_district, n, suf) for n, suf in CA_CWWP2_DISTRICTS]
+        for future in futures:
+            try:
+                records = future.result()
+            except Exception as e:  # noqa: BLE001
+                print(f"[radar-lab] CA CWWP2 district fetch error: {e}")
+                continue
+            for rec in records:
+                cctv = rec.get("cctv", {})
+                loc = cctv.get("location", {})
+                lat, lon = loc.get("latitude"), loc.get("longitude")
+                if not lat or not lon:
+                    continue
+                image_data = cctv.get("imageData", {})
+                snapshot = (image_data.get("static") or {}).get("currentImageURL")
+                stream = image_data.get("streamingVideoURL")
+                if not snapshot and not stream:
+                    continue
+                cam = {
+                    "id": f"CA-{cctv.get('index')}-{loc.get('district')}",
+                    "name": loc.get("locationName") or f"Camera {cctv.get('index')}",
+                    "src": "Caltrans",
+                    "age": None,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                }
+                if snapshot:
+                    cam["snapshot"] = snapshot
+                if stream:
+                    cam["stream"] = stream
+                out.append(cam)
+    return out
+
+
+# Missouri, found the same way as Maryland's ArcGIS layer and
+# California's CWWP2 -- searching ArcGIS Online's own public content
+# search directly for "MoDOT camera" turned up a real, current (last
+# edited within the past few months) Feature Service
+# (`MODOT_Traffic_Cameras`, owned by a MOSEMA -- Missouri State
+# Emergency Management -- account) rather than needing to reverse
+# engineer traveler.modot.org's own SPA. Its layer id is 1, not the
+# usual 0 (the FeatureServer root needs checking per-service, not
+# assumed) -- 871 real cameras, each with a real, working HLS stream
+# (`URL2`; `URL1` is always null on every record, a real per-field
+# quirk of this dataset, not a bug here) confirmed live across several
+# different cameras (one, CAM01, was individually offline -- normal
+# single-camera flakiness, not a systemic problem).
+MO_CAMERAS_URL = (
+    "https://services2.arcgis.com/jWXb6JPWtBjOCalT/arcgis/rest/services/MODOT_Traffic_Cameras/FeatureServer/1/query"
+    "?where=1%3D1&outFields=*&f=json&returnGeometry=true&outSR=4326"
+)
+
+
+def fetch_mo_cameras() -> list[dict]:
+    req = urllib.request.Request(MO_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry") or {}
+        lon, lat = geom.get("x"), geom.get("y")
+        stream_url = attrs.get("URL2")
+        if lon is None or lat is None or not stream_url or stream_url == "<Null>":
+            continue
+        out.append({
+            "id": f"MO-{attrs.get('CAM_ID__')}",
+            "name": attrs.get("DESCRIPTION") or f"Camera {attrs.get('CAM_ID__')}",
+            "src": "MoDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "stream": stream_url,
+        })
+    return out
+
+
+# Oregon, found the same ArcGIS-Online-content-search way as Maryland
+# and Missouri -- a real, recently-updated Feature Service
+# ("Oregon Traffic Cameras", owned by Oregon's own state emergency
+# management account) pointing at `TripCheck_Cameras/FeatureServer`,
+# ODOT's own TripCheck system (the same tripcheck.com already seen as
+# the source for some of Washington's own shared border cameras this
+# session -- confirmed reliable there too). 1,188 real cameras -- more
+# than the ArcGIS service's own 1000-per-page default cap returns in one
+# query, so this needs real pagination (`resultOffset`), unlike every
+# other ArcGIS source found so far this session where one query was
+# always enough.
+OR_CAMERAS_URL = (
+    "https://services.arcgis.com/uUvqNMGPm7axC2dD/arcgis/rest/services/TripCheck_Cameras/FeatureServer/0/query"
+    "?where=1%3D1&outFields=*&f=json&returnGeometry=true&outSR=4326"
+)
+
+
+def fetch_or_cameras() -> list[dict]:
+    out = []
+    offset = 0
+    while True:
+        req = urllib.request.Request(
+            f"{OR_CAMERAS_URL}&resultOffset={offset}",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        feats = data.get("features", [])
+        if not feats:
+            break
+        for feat in feats:
+            attrs = feat.get("attributes", {})
+            geom = feat.get("geometry") or {}
+            lon, lat = geom.get("x"), geom.get("y")
+            image_url = attrs.get("attributes_filename")
+            if lon is None or lat is None or not image_url:
+                continue
+            out.append({
+                "id": f"OR-{attrs.get('attributes_cameraId')}",
+                "name": attrs.get("attributes_title") or f"Camera {attrs.get('attributes_cameraId')}",
+                "src": "ODOT TripCheck",
+                "age": None,
+                "lat": lat,
+                "lon": lon,
+                "snapshot": image_url,
+            })
+        if not data.get("exceededTransferLimit"):
+            break
+        offset += len(feats)
+    return out
+
+
+# Alabama, found via the same ArcGIS-Online-content-search approach as
+# Maryland/Missouri/Oregon -- a real Feature Service
+# (`ALDOT_TC_HFL_public`) tied to ALGO Traffic (the University of
+# Alabama's Center for Advanced Public Safety, which actually runs
+# ALDOT's camera system). Both a real static `ImageUrl`
+# (`api.algotraffic.com`, confirmed live) and a `StreamUrl` per camera,
+# but StreamUrl 404s on every camera spot-checked -- a real, systemic
+# problem with that field specifically (not per-camera flakiness the
+# way one dead MoDOT camera was), so only the working static image is
+# used here. 556 real cameras.
+AL_CAMERAS_URL = (
+    "https://services5.arcgis.com/P2OFkRrXCz6u4SBf/arcgis/rest/services/ALDOT_TC_HFL_public/FeatureServer/0/query"
+    "?where=1%3D1&outFields=*&f=json&returnGeometry=true&outSR=4326"
+)
+
+
+def fetch_al_cameras() -> list[dict]:
+    req = urllib.request.Request(AL_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        attrs = feat.get("attributes", {})
+        geom = feat.get("geometry") or {}
+        lon, lat = geom.get("x"), geom.get("y")
+        image_url = attrs.get("ImageUrl")
+        if lon is None or lat is None or not image_url:
+            continue
+        name = attrs.get("Name") or f"Camera {attrs.get('Id')}"
+        road = attrs.get("PrimaryRoad")
+        out.append({
+            "id": f"AL-{attrs.get('Id')}",
+            "name": f"{road} & {attrs.get('CrossStreet')}" if road and attrs.get("CrossStreet") else name,
+            "src": attrs.get("OrganizationId") or "ALDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# North Dakota, found by tracing travel.dot.nd.gov's own Angular bundle
+# for the real backend domain (`travelfiles.dot.nd.gov`) and then the
+# exact URL-construction function it calls for each map layer
+# (`Kt(...)`, which builds `https://{domain}/geojson/{id}/{id}.json` for
+# undated layers) -- confirmed the "cameras" layer resolves to a real,
+# public, no-auth GeoJSON. Same multi-camera-per-site shape as Montana/
+# South Dakota's Iteris data (a `Cameras` array per site, not one
+# image per site) but a different vendor/schema (`LinkPath` per
+# camera, not `image`) -- needs its own fetcher rather than reusing
+# theirs. 189 sites, 809 real cameras total.
+ND_CAMERAS_URL = "https://travelfiles.dot.nd.gov/geojson/cameras/cameras.json"
+
+
+def fetch_nd_cameras() -> list[dict]:
+    req = urllib.request.Request(ND_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        coords = (feat.get("geometry") or {}).get("coordinates")
+        if not coords:
+            continue
+        lon, lat = coords[0], coords[1]
+        site_id = props.get("ObjectID") or feat.get("id")
+        for i, cam in enumerate(props.get("Cameras", [])):
+            image_url = cam.get("LinkPath") or cam.get("FullPath")
+            if not image_url:
+                continue
+            out.append({
+                "id": f"ND-{site_id}-{i}",
+                "name": cam.get("Description") or f"Camera {site_id}-{i}",
+                "src": "NDDOT",
+                "age": None,
+                "lat": lat,
+                "lon": lon,
+                "snapshot": image_url,
+            })
+    return out
+
+
+# Michigan's MiDrive is the oldest-feeling platform found this
+# session: a plain JSON array at `mdotjboss.state.mi.us/MiDrive/
+# camera/list`, but every field that should be structured data
+# (coordinates, image URL) is instead a pre-rendered HTML fragment
+# meant to be dropped directly into the page -- lat/lon has to be
+# regexed out of an embedded "Go to" link's own query string
+# (`county`), and the image src out of an embedded `<img>` tag
+# (`image`), rather than either being its own real field. Confirmed
+# real and current live: 804 cameras, image URL 301-redirects to
+# `micamerasimages.net` (a real, working image once followed).
+MI_CAMERAS_URL = "https://mdotjboss.state.mi.us/MiDrive/camera/list"
+_MI_LATLON_RE = re.compile(r"lat=([\-\d.]+)&lon=([\-\d.]+)&zoom=\d+&id=(\d+)")
+_MI_IMG_SRC_RE = re.compile(r'src="([^"]+)"')
+
+
+def fetch_mi_cameras() -> list[dict]:
+    req = urllib.request.Request(MI_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rows = json.loads(resp.read())
+    out = []
+    for row in rows:
+        latlon_match = _MI_LATLON_RE.search(row.get("county") or "")
+        img_match = _MI_IMG_SRC_RE.search(row.get("image") or "")
+        if not latlon_match or not img_match:
+            continue
+        lat, lon, cam_id = latlon_match.groups()
+        name = f"{row.get('route', '')}{row.get('location', '')}".strip() or f"Camera {cam_id}"
+        out.append({
+            "id": f"MI-{cam_id}",
+            "name": name,
+            "src": "MDOT",
+            "age": None,
+            "lat": float(lat),
+            "lon": float(lon),
+            "snapshot": img_match.group(1),
+        })
+    return out
+
+
+# Tennessee's SmartWay is a modern Angular SPA that -- like
+# Washington's -- loads its real API config at runtime rather than
+# baking the URL into its JS bundle, but found the config file itself
+# this time (`grep`ping the shared vendor chunk for the literal
+# "config.prod.json" reference the loader function uses) rather than
+# going around it via a public GIS server. That reference is
+# `` `${baseUrl}config\${suffix}` `` in the original TypeScript -- a
+# literal backslash, not a template-literal typo here, which still
+# resolves fine served over HTTP (`config/config.prod.json` works
+# identically). That config contains both the real API base URL
+# (`tdot.tn.gov/opendata/api/public/`) and a real, plainly-embedded
+# client-side API key -- meant to be public since it ships in every
+# page load, same as a Google Maps browser key. 668 real cameras, each
+# with both a real static thumbnail and a real HLS stream (both
+# confirmed live) -- ~129 of the 668 are marked `active:"false"` and
+# skipped, real inactive/removed cameras still present in the feed
+# rather than a data quality problem.
+TN_CAMERAS_URL = "https://www.tdot.tn.gov/opendata/api/public/RoadwayCameras?apiKey=8d3b7a82635d476795c09b2c41facc60"
+
+
+def fetch_tn_cameras() -> list[dict]:
+    req = urllib.request.Request(TN_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rows = json.loads(resp.read())
+    out = []
+    for row in rows:
+        if row.get("active") != "true":
+            continue
+        lat, lon = row.get("lat"), row.get("lng")
+        if lat is None or lon is None:
+            continue
+        cam = {
+            "id": f"TN-{row.get('id')}",
+            "name": row.get("title") or row.get("description") or f"Camera {row.get('id')}",
+            "src": row.get("jurisdiction") or "TDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+        }
+        if row.get("thumbnailUrl"):
+            cam["snapshot"] = row["thumbnailUrl"]
+        if row.get("httpsVideoUrl"):
+            cam["stream"] = row["httpsVideoUrl"]
+        if cam.get("snapshot") or cam.get("stream"):
+            out.append(cam)
+    return out
+
+
+# Delaware's real camera list lives behind a genuinely old-school
+# jQuery plugin (`camerafy`, used to feed a JW Player instance) rather
+# than a modern SPA -- found by fetching that plugin's own minified JS
+# and reading its `$.getCameraFeed` function directly, which hardcodes
+# both the real endpoint and a fixed query-string id:
+# `tmc.deldot.gov/json/videocamera.json?id=4yte`. Real, clean data: 360
+# cameras, almost all enabled/active, each with a working HLS URL
+# (`m3u8s`) confirmed live.
+DE_CAMERAS_URL = "https://tmc.deldot.gov/json/videocamera.json?id=4yte"
+
+
+def fetch_de_cameras() -> list[dict]:
+    req = urllib.request.Request(DE_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for row in data.get("videoCameras", []):
+        if not row.get("enabled"):
+            continue
+        lat, lon = row.get("lat"), row.get("lon")
+        stream_url = (row.get("urls") or {}).get("m3u8s")
+        if lat is None or lon is None or not stream_url:
+            continue
+        out.append({
+            "id": f"DE-{row.get('id')}",
+            "name": row.get("title") or f"Camera {row.get('id')}",
+            "src": row.get("county") or "DelDOT",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "stream": stream_url,
         })
     return out
 
@@ -1508,6 +2312,102 @@ def fetch_tx_cameras() -> list[dict]:
     return out
 
 
+# "CARS Program" / Castle Rock ITS, newer generation -- found 2026-09-26
+# chasing Massachusetts's real backend (its own frontend domain isn't
+# the API host, same pattern as Connecticut). This generation is a real
+# microservices API (`{domain}/cameras_v1/api/cameras`, a plain JSON
+# array), not the classic DataTables platform FL/GA/LA/PA/NC/NY/AZ/CT/WI
+# run -- found by locating the real API-map object
+# (`{accounts,amber,cameras,cms,...}`) Massachusetts's own JS bundle
+# builds, then testing the literal base URL it resolved to. That base
+# URL looked like a staging/test host (`iatg-carsprogram-org.stage.
+# carstest.org`) -- real data came back from it, but a cleaner
+# production-looking domain (`iatg.carsprogram.org`, matching the
+# pattern Massachusetts's own domain used) turned out to have more
+# recent data and is what's actually used here. Same domain-naming
+# pattern (`{2-letter state}tg.carsprogram.org`) confirmed working for
+# Kansas by direct guess. New Mexico checked (`nmroads.com`) and isn't
+# on this platform at all -- an unrelated, much older WebGL-based site.
+CARS_TG_DOMAINS = {
+    "IA": "iatg.carsprogram.org",
+    "MA": "matg.carsprogram.org",
+    "KS": "kstg.carsprogram.org",
+    "MN": "mntg.carsprogram.org",
+    "NE": "netg.carsprogram.org",
+}
+
+
+def fetch_cars_tg_cameras(domain: str, state_code: str) -> list[dict]:
+    req = urllib.request.Request(
+        f"https://{domain}/cameras_v1/api/cameras",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rows = json.loads(resp.read())
+    out = []
+    for row in rows:
+        loc = row.get("location") or {}
+        lat, lon = loc.get("latitude"), loc.get("longitude")
+        views = row.get("views") or []
+        image_url = next((v.get("videoPreviewUrl") for v in views if v.get("videoPreviewUrl")), None)
+        if not image_url:
+            # Nebraska's rows carry no videoPreviewUrl at all -- their
+            # views are plain still images already (type STILL_IMAGE),
+            # confirmed a real, directly-usable snapshot -- found
+            # 2026-09-26 checking why NE returned almost nothing under
+            # the videoPreviewUrl-only logic that worked for IA/MA/KS/MN.
+            image_url = next((v.get("url") for v in views if v.get("type") == "STILL_IMAGE" and v.get("url")), None)
+        if lat is None or lon is None or not image_url:
+            continue
+        out.append({
+            "id": f"{state_code}-{row.get('id')}",
+            "name": row.get("name") or f"Camera {row.get('id')}",
+            "src": (row.get("cameraOwner") or {}).get("name") or state_code,
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
+# Colorado is on the same "CARS Program" vendor but a different, newer
+# sub-generation again -- a real GeoJSON FeatureCollection at
+# `{api}/map-features`, not the plain JSON array the IA/MA/KS domains
+# above return. Found via Colorado's own real runtime config
+# (`511.cotrip.org/configs/main.json`), which lists the actual camera
+# API host directly (`api-511x-co.carsprogram.org`) -- the bare API root
+# only returns a generic `{"healthy":true}` health-check response
+# regardless of path/method tried; `/map-features` (found in Colorado's
+# own JS bundle, where the frontend actually builds this exact request)
+# is the real data endpoint.
+CO_CAMERAS_URL = "https://api-511x-co.carsprogram.org/cameras/map-features"
+
+
+def fetch_co_cameras() -> list[dict]:
+    req = urllib.request.Request(CO_CAMERAS_URL, headers={"User-Agent": "Mozilla/5.0 (compatible; radar-lab)"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    out = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        coords = (feat.get("geometry") or {}).get("coordinates")
+        image_url = next((v.get("videoPreviewUrl") for v in props.get("views") or [] if v.get("videoPreviewUrl")), None)
+        if not coords or not image_url:
+            continue
+        lon, lat = coords[0], coords[1]
+        out.append({
+            "id": f"CO-{props.get('id')}",
+            "name": props.get("name") or f"Camera {props.get('id')}",
+            "src": props.get("cameraOwner") or "CO",
+            "age": None,
+            "lat": lat,
+            "lon": lon,
+            "snapshot": image_url,
+        })
+    return out
+
+
 # Separate from _camera_cache (the near-radar-site 4-state one) --
 # whole-state pulls are much more expensive (many paginated requests for
 # a big state), so cached longer (5min not 2min) and only ever fetched
@@ -1515,8 +2415,9 @@ def fetch_tx_cameras() -> list[dict]:
 _state_camera_cache: dict[str, dict] = {}
 STATE_CAMERA_CACHE_SEC = 300
 SUPPORTED_CAMERA_STATES = sorted(
-    set(STATE_DATATABLES_DOMAINS) | set(STATE_ITERIS_GEOJSON_URLS) | TRAVELMIDWEST_STATES
-    | {"KY", "HI", "VA", "MS", "TX"}
+    set(STATE_DATATABLES_DOMAINS) | set(STATE_ITERIS_GEOJSON_URLS) | set(STATE_ITERIS_MULTICAM_GEOJSON_URLS)
+    | TRAVELMIDWEST_STATES | NEWENGLAND_STATES | set(CARS_TG_DOMAINS)
+    | {"KY", "HI", "VA", "MS", "TX", "CO", "RI", "WA", "MD", "CA", "MO", "OR", "AL", "ND", "MI", "TN", "DE"}
 )
 
 
@@ -1546,8 +2447,12 @@ def get_cameras_for_state(state_code: str) -> list[dict] | None:
         cams = fetch_datatables_cameras(STATE_DATATABLES_DOMAINS[state_code], state_code)
     elif state_code in STATE_ITERIS_GEOJSON_URLS:
         cams = fetch_iteris_cameras(STATE_ITERIS_GEOJSON_URLS[state_code], state_code)
+    elif state_code in STATE_ITERIS_MULTICAM_GEOJSON_URLS:
+        cams = fetch_iteris_multicam_cameras(STATE_ITERIS_MULTICAM_GEOJSON_URLS[state_code], state_code)
     elif state_code in TRAVELMIDWEST_STATES:
         cams = [c for c in fetch_travelmidwest_cameras() if str(c.get("id", "")).startswith(f"{state_code}-")]
+    elif state_code in NEWENGLAND_STATES:
+        cams = [c for c in fetch_datatables_cameras(NEWENGLAND_DOMAIN, None) if str(c.get("id", "")).startswith(f"{state_code}-")]
     elif state_code == "KY":
         cams = fetch_kytc_cameras()
     elif state_code == "HI":
@@ -1558,6 +2463,32 @@ def get_cameras_for_state(state_code: str) -> list[dict] | None:
         cams = fetch_ms_cameras()
     elif state_code == "TX":
         cams = fetch_tx_cameras()
+    elif state_code in CARS_TG_DOMAINS:
+        cams = fetch_cars_tg_cameras(CARS_TG_DOMAINS[state_code], state_code)
+    elif state_code == "CO":
+        cams = fetch_co_cameras()
+    elif state_code == "RI":
+        cams = fetch_ri_cameras()
+    elif state_code == "WA":
+        cams = fetch_wa_cameras()
+    elif state_code == "MD":
+        cams = fetch_md_cameras()
+    elif state_code == "CA":
+        cams = fetch_ca_cameras()
+    elif state_code == "MO":
+        cams = fetch_mo_cameras()
+    elif state_code == "OR":
+        cams = fetch_or_cameras()
+    elif state_code == "AL":
+        cams = fetch_al_cameras()
+    elif state_code == "ND":
+        cams = fetch_nd_cameras()
+    elif state_code == "MI":
+        cams = fetch_mi_cameras()
+    elif state_code == "TN":
+        cams = fetch_tn_cameras()
+    elif state_code == "DE":
+        cams = fetch_de_cameras()
     else:
         return None
 
@@ -1895,6 +2826,40 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/level3/nmd":
             cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
             self._json(cache.get_level3("NMD") or {"points": []})
+
+        elif path == "/api/level3/nhi":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            self._json(cache.get_level3("NHI") or {"points": []})
+
+        elif path == "/api/level3/ntv":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            self._json(cache.get_level3("NTV") or {"points": []})
+
+        elif path.startswith("/api/") and path[5:] in LEVEL3_RADIAL_PRODUCTS:
+            endpoint_name = path[5:]
+            product_code, resp_key = LEVEL3_RADIAL_PRODUCTS[endpoint_name]
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            data = cache.get_level3_radial(product_code)
+            if data is None:
+                self._json({"error": f"no {endpoint_name} data cached yet"}, 503)
+                return
+            self._json(data)
+
+        elif path == "/api/composite":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            _png, bounds, updated = cache.get_composite()
+            if bounds is None:
+                self._json({"error": "no composite reflectivity rendered yet"}, 503)
+                return
+            self._json({"bounds": bounds, "updated": updated})
+
+        elif path == "/api/composite.png":
+            cache = get_cache(qs.get("site", [DEFAULT_SITE])[0])
+            png, _bounds, _updated = cache.get_composite()
+            if png is None:
+                self.send_error(503)
+                return
+            self._binary(png, "image/png")
 
         elif path.startswith("/api/") and path[5:] in FIELD_MAP:
             name = path[5:]

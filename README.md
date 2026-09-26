@@ -499,6 +499,53 @@ requirement of the software itself.
   product one. This same GOES-East/GOES-West pattern is exactly what
   made adding GOES-West to the lightning feature (below) a same-day
   follow-up rather than new architecture.
+- **Default startup state changed, 2026-09-25**: everything off at
+  launch except the national mosaic (was: cameras/alerts/GPS/NST/NMD/
+  site-pills/lightning/snowplows on, mosaic off). A clean map on first
+  load, not a cluttered one -- turn on what you actually want to see.
+- **Composite Reflectivity + 5 new Level III radial products + 2 new
+  severe-weather alert layers, built 2026-09-25**: real NOAA-precomputed
+  products, not recomputed here -- found by listing every product NOAA
+  actually publishes for a real site (100 distinct codes total) rather
+  than guessing, then verifying each candidate's real data shape against
+  an actual decoded file instead of assuming from the product family name.
+  - **Composite Reflectivity (NCR)** -- "combine all the tilts" per
+    radar site, NOAA's own precomputed maximum-reflectivity-across-every-
+    elevation field (not recomputed from raw Level II tilts here --
+    NOAA already does the real geometric work of combining tilts of
+    different resolution correctly; redoing that would be a lot of work
+    for a worse result). Turned out to be a real x/y raster grid (not
+    radial data like every other product in this app), so it renders
+    server-side to a PNG per site, same approach and same DBZ_STOPS
+    color table as the national mosaic -- available as a "Composite
+    Reflectivity (all tilts)" product choice per panel.
+  - **5 new radial products** -- Storm Relative Velocity (N0S), Digital
+    VIL (DVL), Enhanced Echo Tops (EET), Hydrometeor Classification
+    (HHC), 1-Hour Precipitation (OHA). Confirmed live these share the
+    *same* azimuth/range radial shape as the existing Level II products,
+    so they reuse the existing client-side RadarTileLayer renderer as
+    just more product choices -- no new rendering pipeline needed, only
+    Composite Reflectivity did. Real bug hit and fixed during
+    verification: `map_data()` needs the raw integer color-level codes
+    as array indices, not floats -- an incorrect `dtype="float64"`
+    coercion broke all 6 new server-rendered products with an "arrays
+    used as indices" error until removed. A second real, undocumented
+    quirk found live: Echo Tops' `map_data()` returns a `(values,
+    is_below_radar_coverage)` tuple instead of a plain array, unlike
+    every other product -- not documented anywhere obvious, found by
+    the actual runtime error.
+  - **Hydrometeor Classification's category colors are pulled from the
+    decode library's own source** (MetPy's `DigitalHMCMapper`), not
+    guessed -- the most trustworthy source available since it's
+    literally what produces the numbers being colored.
+  - **2 new severe-weather alert layers**: Hail Index (NHI) and
+    Tornadic Vortex Signature (NTV) -- same point/graphic-page product
+    family as the existing Storm Tracks/Mesocyclone layers, so these
+    reused the existing generic point-decoder with no new decode logic,
+    just two more product codes in the same poll loop. Both legitimately
+    report empty whenever there's no active severe weather to detect --
+    confirmed via real testing, same as NST/NMD's already-established
+    behavior on a quiet day, not a bug.
 - **Site indicator consistency fix, built 2026-09-24**: in single-pane
   view, the top-right HUD "Radar site" dropdown could drift out of sync
   with the panel's own toolbar dropdown / active site pill -- only the
@@ -624,6 +671,270 @@ requirement of the software itself.
     parallelized (`ThreadPoolExecutor(max_workers=10)`, same pattern as
     the DataTables states' pagination). Real measured cost: ~14-18s for
     the full state on a cache miss.
+  - **New York and New England (NH/ME/VT) added 2026-09-25** -- same
+    DataTables platform as FL/GA/LA/PA/NC, found with a quick domain
+    check (`511ny.org`, `newengland511.org`) rather than a deep
+    reverse-engineering dig, once the Northeast became the priority for
+    an actual approaching storm. New York: 1,877 real cameras. New
+    England: one shared domain covering three states at once via each
+    row's own `areaId` field (confirmed live: exactly NH/ME/VT, 406
+    total records, no other state present) -- a new mode added to
+    `fetch_datatables_cameras` (`state_code=None`) rather than a
+    separate function, reusing the exact same pagination/parsing
+    already proven for the single-state sources. Massachusetts/Rhode
+    Island/Connecticut checked against several likely domains and don't
+    match this platform -- not found yet, not on this platform.
+    Real reliability issue found and fixed during verification:
+    511ny.org's server intermittently 500s on some fraction of the ~19
+    concurrent paginated requests a state its size needs -- confirmed
+    transient (different pages failed on repeated runs, not the same
+    ones) by literally re-running the fetch 3 times and watching the
+    failure count change. Fixed with one automatic retry per page,
+    benefiting every state on this platform, not just New York.
+  - **Real vendor identified, more states found, 2026-09-26**: chasing
+    Massachusetts specifically led to Massachusetts's own JS bundle
+    referencing `511ny.org`, `cttravelsmart.org`, `az511.gov`,
+    `cotrip.org`, `511ia.org`, `kandrive.org`, and `nmroads.com` as
+    sibling deployments -- "CARS Program" / Castle Rock ITS runs this
+    same DataTables platform (what FL/GA/LA/PA/NC/NY were already
+    running on) across a real nationwide list of states, not just a
+    coincidence limited to the Southeast. Confirmed two more this way:
+    **Arizona** (644 cameras, `az511.gov`) and **Connecticut** (347
+    cameras -- its public-facing `cttravelsmart.org` redirects to the
+    real API host, `ctroads.org`). Also found a real upgrade for
+    **Wisconsin**: `511wi.gov` (this same platform) has 490 real cameras
+    vs. the 263 the existing TravelMidwest source was returning for the
+    same state -- switched WI to this source rather than keeping both.
+    - **Massachusetts, Colorado, Iowa, Kansas -- cracked and added,
+      2026-09-26**: this vendor turns out to run at least two more
+      generations beyond the classic DataTables platform. Massachusetts's
+      own JS bundle builds a real API-map object
+      (`{accounts,amber,cameras,cms,...}`) that resolves to a
+      microservices backend, not its `mass511.com` frontend (same pattern
+      as Connecticut) -- found via that object, confirmed at
+      `matg.carsprogram.org/cameras_v1/api/cameras` (a plain JSON array,
+      307 cameras). The domain-naming pattern it revealed
+      (`{2-letter state}tg.carsprogram.org`) worked directly for
+      **Iowa** (`iatg.carsprogram.org`, 859 cameras) and **Kansas**
+      (`kstg.carsprogram.org`, 608 cameras) by guess alone. A parallel
+      "stage.carstest.org" form of these same domains also answers but
+      serves visibly stale data (older `lastUpdated` timestamps,
+      confirmed by direct comparison) -- the clean `.carsprogram.org`
+      form is what's actually used. **Colorado** (`cotrip.org`) is a
+      third, newer generation again: its real runtime config
+      (`511.cotrip.org/configs/main.json`) names the camera API host
+      (`api-511x-co.carsprogram.org`), whose bare root only answers a
+      generic `{"healthy":true}` -- the real data endpoint,
+      `/cameras/map-features` (a GeoJSON FeatureCollection, 1,024
+      cameras), was found in Colorado's own JS bundle where the frontend
+      actually builds that request. All four verified live end-to-end
+      through radar-lab's own `/api/cameras` endpoint, not just against
+      the upstream APIs directly (grouped counts: CO 794, IA 663, MA 280,
+      KS 201 after de-duplicating co-located cameras). **New Mexico**
+      checked and confirmed *not* on this platform at all --
+      `nmroads.com` is a real but unrelated, older WebGL-based site;
+      several domain-pattern guesses against `carsprogram.org` all
+      failed to connect.
+    - **Minnesota and Nebraska added, 2026-09-26**: same
+      `{state}tg.carsprogram.org` pattern, found by brute-forcing every
+      remaining state's 2-letter code against it rather than chasing
+      another bundle. **Minnesota** (`mntg.carsprogram.org`): 1,528 real
+      cameras. **Nebraska** (`netg.carsprogram.org`): 350 real cameras,
+      but almost none of them carry the `videoPreviewUrl` field the
+      other states on this platform use -- found live that Nebraska's
+      own `views` entries are already plain still images
+      (`type: "STILL_IMAGE"`, a direct `url` field), a real per-state
+      schema difference, not missing data. Fixed by falling back to
+      that field when no `videoPreviewUrl` is present, which fixed
+      Nebraska without touching any other state's behavior.
+  - **Rhode Island added, 2026-09-26**: a distinct platform again, nothing
+    to do with CARS Program -- the real data is a public Esri ArcGIS
+    FeatureServer layer (`risegis.ri.gov/hosting/rest/services/RIDOT/
+    Rhodeways/MapServer/6`), found by tracing RIDOT's interactive camera
+    map into its own JS, which constructs a standard ArcGIS
+    `FeatureLayer` pointed straight at it -- a documented, queryable
+    endpoint, not something needing further reverse-engineering once
+    found. 143 real cameras, each with WGS84 lat/lon already on the
+    attributes and a direct snapshot field. This closes the original
+    Northeast gap (RI, alongside MA and CT, was one of the three states
+    flagged as "not found yet" back on 2026-09-25) -- MA and CT are now
+    solved via CARS Program above, RI via this ArcGIS route.
+  - **Washington added, 2026-09-26**: another ArcGIS FeatureServer,
+    found a different way -- WSDOT's own camera-map SPA loads its
+    endpoint from a runtime config object that never appears as a
+    literal string anywhere in its JS bundle (grepping it the way that
+    worked for Rhode Island came up empty), so the actual endpoint was
+    found by going straight to WSDOT's own public ArcGIS Server
+    (`data.wsdot.wa.gov/arcgis/rest/services`) and browsing its real
+    folder listing until a `TravelInformation/TravelInfoCamerasWeather`
+    service turned up. 1,705 real cameras, queried with `outSR=4326` so
+    ArcGIS reprojects to plain lat/lon server-side instead of a manual
+    Web-Mercator conversion. Includes some real cross-border cameras
+    (Oregon's own tripcheck.com feed for shared I-5 crossings) -- a
+    real feature of WSDOT's own data, not a bug here.
+  - **Montana and South Dakota added, 2026-09-26**: found on the same
+    Iteris ATIS vendor South Carolina already uses
+    (`{state}.cdn.iteris-atis.com/geojson/...`), found the same way as
+    the Minnesota/Nebraska win above -- brute-forcing every remaining
+    state's 2-letter code against the known URL pattern rather than
+    digging through another bundle. Both real but small, rural-interstate
+    camera networks (38 sites/38 cameras for MT, 40 sites/173 cameras
+    for SD) -- not a partial feed, genuinely how sparse these states'
+    camera networks are. Also a distinct, older schema from South
+    Carolina's: each site holds a real `cameras` array (multiple
+    views -- north/south/road-surface -- at the same physical pole)
+    rather than one flat `image_url` per site, needing a second fetcher
+    function rather than reusing South Carolina's.
+  - **Utah, Nevada, Idaho, and Alaska added, 2026-09-26**: the exact
+    same DataTables `/List/GetData/Cameras` platform yet again, but this
+    time it's really IBI Group's "ibi511" product line (the vendor
+    behind `prod-ut.ibi511.com`'s and `prod-nv.ibi511.com`'s own
+    separate, *keyed* developer APIs) sharing the identical unauthenticated
+    public-site backend that "CARS Program" states also use -- found by
+    testing the known endpoint directly against each state's likely
+    domain rather than digging through another bundle. Zero new parsing
+    code needed since `fetch_datatables_cameras` already handles this
+    shape as-is. Real counts confirmed live: Utah 2,081, Nevada 652,
+    Idaho 457, Alaska 130.
+  - **Maryland added, 2026-09-26**: CHART (the state's traffic
+    management system) does have a public ArcGIS FeatureServer for
+    camera locations, but its own `url` field there is just an HTML
+    player page, not a usable link -- one more layer than Rhode
+    Island's version of this same idea needed. The real source is
+    CHART's own JSON feed (`chart.maryland.gov/DataFeeds/
+    GetCamerasJson`, found by searching for it directly rather than
+    digging further into the ArcGIS layer), whose `publicVideoURL` is
+    itself *another* HTML player page -- but that page's own inline
+    script builds the real HLS stream URL from two fields already
+    present in the original JSON (`cctvIp` + `id`), so the wrapper page
+    never actually needs fetching. 552 real cameras with working live
+    video (confirmed a real HLS manifest), unlike Texas's expired-token
+    problem -- reuses the same hls.js wiring built for TX.
+  - **California added, 2026-09-26**: found through Caltrans's own
+    *documented, public* API (CWWP2, no key needed) rather than
+    reverse-engineering QuickMap's SPA -- the easiest route of any
+    state found this session, once its documentation page was found.
+    Real per-district JSON feeds (`cwwp2.dot.ca.gov/data/{d1..d12}/
+    cctv/cctvStatus{D01..D12}.json` -- zero-padded past D9 but not
+    before it, a real inconsistency in Caltrans's own filenames), each
+    camera carrying both a real static image URL and a real HLS stream
+    URL. No single statewide endpoint exists, so this needs 12 separate
+    requests (parallelized) -- by far the largest state found this
+    session at 3,591 real cameras.
+  - **Missouri added, 2026-09-26**: found via ArcGIS Online's own public
+    content search (searching directly for "MoDOT camera" rather than
+    digging through traveler.modot.org's SPA) -- a real, currently
+    maintained Feature Service owned by Missouri's state emergency
+    management account. Its layer id is 1, not the usual 0 (checked the
+    FeatureServer's own layer list rather than assuming). 871 real
+    cameras with working HLS video via a `URL2` field (`URL1` is always
+    null on every record -- a real per-field quirk, not a bug here).
+  - **Oregon added, 2026-09-26**: same ArcGIS-content-search approach as
+    Missouri and Maryland -- a real, recently-updated Feature Service
+    ("Oregon Traffic Cameras," owned by Oregon's own emergency
+    management account) pointing at ODOT's TripCheck system
+    (`TripCheck_Cameras/FeatureServer`) -- the same tripcheck.com already
+    seen as the source for some of Washington's shared border cameras.
+    1,188 real cameras -- more than the service's own 1000-per-page
+    default cap returns in one query, the first ArcGIS source this
+    session that actually needed real pagination (`resultOffset`)
+    rather than one request being enough.
+  - **Arkansas found but not added**: ArcGIS Online search turned up a
+    real, current ArDOT Feature Service (`iDriveCCTV_20260707_v2`), but
+    it's a small subset (49 cameras, not the 500+ IDriveArkansas is
+    known to run) and its HLS stream requires a `Referer` header
+    matching ArDOT's own frontend domain exactly (confirmed live: no
+    Referer gets a 403, the literal `idrivearkansas.com` value gets a
+    real redirect to a working tokenized stream) -- browsers send the
+    *requesting* page's own origin as Referer for cross-origin video
+    fetches, not an arbitrary spoofed one, so radar-lab's own frontend
+    can't satisfy this check. Not pursued further given the low camera
+    count already found didn't justify chasing a workaround.
+  - **Alabama added, 2026-09-26**: same ArcGIS-content-search approach
+    again -- a real Feature Service (`ALDOT_TC_HFL_public`) tied to
+    ALGO Traffic (University of Alabama's Center for Advanced Public
+    Safety, which actually runs ALDOT's camera system day to day). Real
+    static `ImageUrl` per camera (confirmed live), but its `StreamUrl`
+    field 404s on every camera spot-checked -- a systemic problem with
+    that field specifically, not per-camera flakiness -- so only the
+    working static image is used. 556 real cameras.
+  - **North Dakota added, 2026-09-26**: traced travel.dot.nd.gov's own
+    Angular bundle for its real backend domain
+    (`travelfiles.dot.nd.gov`) and the exact function that builds each
+    map layer's URL from it, confirming the "cameras" layer resolves to
+    a real, public, no-auth GeoJSON. Same multi-camera-per-site shape as
+    Montana/South Dakota's Iteris data (a `Cameras` array per site) but
+    a different vendor/schema (`LinkPath` per camera, not `image`) --
+    needed its own fetcher. 189 sites, 809 real cameras.
+  - **Michigan added, 2026-09-26**: the oldest-feeling platform found
+    this session -- a real plain JSON array
+    (`mdotjboss.state.mi.us/MiDrive/camera/list`, confirmed via a
+    GitHub PR that had already reverse-engineered it) where every field
+    that should be structured data is instead a pre-rendered HTML
+    fragment: coordinates have to be regexed out of an embedded "Go to"
+    link's query string, and the image URL out of an embedded `<img>`
+    tag, rather than either being its own real field. 804 real cameras,
+    image URL 301-redirects to a real working `micamerasimages.net`
+    image once followed.
+  - **Tennessee added, 2026-09-26**: SmartWay is a modern Angular SPA
+    that -- like Washington's -- loads its real API config at runtime
+    rather than baking the URL into its JS bundle, but found the config
+    file itself this time by grepping the shared vendor chunk for the
+    literal `config.prod.json` reference its loader function uses,
+    rather than going around it via a public GIS server the way
+    Washington's needed. That reveals both the real API base URL
+    (`tdot.tn.gov/opendata/api/public/`) and a real, plainly-embedded
+    client-side API key -- meant to be public since it ships in every
+    page load, same as a Google Maps browser key. 668 real cameras,
+    each with a real static thumbnail and a real HLS stream (both
+    confirmed live); ~129 are marked inactive in the feed and skipped.
+  - **Oklahoma found but not added**: real camera positions (761,
+    confirmed) live behind a LoopBack API found by grepping the site's
+    own Angular bundle for its service-layer HTTP calls
+    (`CameraPoles?filter=...`, not documented or guessable from the
+    site's own public error messages alone). Every camera's HLS
+    `streamSrc` 404s, though -- not a stale-token problem like Texas's,
+    but Cloudflare's bot-challenge page intercepting the request before
+    it reaches the real video server (`stream.oktraffic.org` itself
+    returns a JS challenge page, confirmed by fetching it directly).
+    That challenge blocks non-interactive requests generally, including
+    the kind a `<video>` tag's own fetch would make from a real
+    browser, not just this backend -- a real infrastructure blocker,
+    not something fixable by adjusting headers.
+  - **West Virginia found but not added**: real camera positions (132)
+    live behind a genuinely old ASP.NET map widget
+    (`wv511.org/wsvc/gmap.asmx/buildCamerasJSONjs`, found by tracing
+    three layers of JS -- the map page's own script, into a Google Maps
+    wrapper, into a lazily-loaded "cameras" sub-script that finally
+    named the real endpoint). That feed carries positions and labels
+    but no snapshot/stream URL at all -- the actual streaming logic
+    (`LoadStreamingCam`) is called from two different pages but its
+    definition wasn't found in any JS file either page actually loads,
+    and guessing a Wowza-style stream domain from the pattern several
+    other states use didn't connect. Positions only, no viewable image
+    -- not pursued further.
+  - **New Jersey found but not added**: 511nj.org's own Angular bundle
+    references a real `cameraTileService`/`getCameraList()` call, but
+    every `/api/*` path guess against the site returned a WAF block
+    (403 "Access Denied") rather than a real 404 -- suggesting the real
+    API is either on a different, unguessed subdomain or is actively
+    defended against exactly this kind of probing. Not cracked this
+    session.
+  - **Ohio, Wyoming, Delaware's DC-equivalent** (i.e. genuinely not
+    pursued to a conclusion): OHGO's public API is real but requires a
+    registered developer key (not just an unauthenticated public
+    endpoint like every other state found this session); Wyoming's
+    511 site is old-style server-rendered ASP.NET with no obvious JS
+    bundle to trace, not dug into further given time spent on West
+    Virginia's similar platform coming up empty.
+  - **Delaware added, 2026-09-26**: real camera list lives behind a
+    genuinely old-school jQuery plugin (`camerafy`, built to feed a
+    JW Player instance) rather than a modern SPA -- found by fetching
+    that plugin's own minified JS and reading its `$.getCameraFeed`
+    function directly, which hardcodes both the real endpoint and a
+    fixed query-string id (`tmc.deldot.gov/json/videocamera.json?
+    id=4yte`). 360 real cameras, almost all enabled/active, each with a
+    working HLS URL confirmed live.
   - **Texas added 2026-09-25, but currently non-functional** (3,433
     grouped cameras): a sixth platform, MapLarge (a commercial GIS data
     vendor) -- found by locating the real `table/query` request object

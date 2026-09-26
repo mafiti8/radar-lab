@@ -1,0 +1,8 @@
+# Only needed to BUILD the standalone .exe (see bin/radar_lab.spec) --
+# not needed to just run radar_lab.py or radar_lab_app.py from source.
+# pyinstaller-hooks-contrib carries community-maintained PyInstaller
+# hooks for netCDF4 and pywebview specifically, which real testing
+# elsewhere (not this project) found meaningfully reduces the manual
+# hidden-import/data-file guesswork for both.
+pyinstaller
+pyinstaller-hooks-contrib

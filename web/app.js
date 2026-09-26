@@ -20,6 +20,11 @@ const PRODUCT_ENDPOINTS = {
   zdr_db: "/api/zdr",
   cc: "/api/cc",
   phidp_deg: "/api/phidp",
+  srv_ms: "/api/storm_relative_velocity",
+  vil_kgm2: "/api/vil",
+  echo_tops_kft: "/api/echo_tops",
+  precip_in: "/api/precip_1h",
+  hc_code: "/api/hydrometeor_class",
 };
 const PRODUCT_LABELS = {
   reflectivity_dbz: "Base Reflectivity",
@@ -27,6 +32,12 @@ const PRODUCT_LABELS = {
   zdr_db: "Diff. Reflectivity (ZDR)",
   cc: "Correlation Coef. (CC)",
   phidp_deg: "Diff. Phase (PhiDP, raw)",
+  srv_ms: "Storm Relative Velocity",
+  vil_kgm2: "VIL",
+  echo_tops_kft: "Echo Tops",
+  precip_in: "1-Hour Precipitation",
+  hc_code: "Hydrometeor Classification",
+  composite: "Composite Reflectivity (all tilts)",
 };
 const DEFAULT_PRODUCTS = ["reflectivity_dbz", "velocity_ms", "zdr_db", "cc"];
 const DEFAULT_CENTER = [38.4, -87.7];
@@ -233,12 +244,82 @@ function phidpColor(v) {
   return hslToRgb(v, 0.7, 0.5);
 }
 
+// Level III radial products, added 2026-09-25 -- see LEVEL3_RADIAL_PRODUCTS
+// in radar_lab.py for how these get decoded; storm-relative velocity
+// reuses velColor directly (same physical quantity/units as base
+// velocity, same red-away/green-toward convention).
+function vilColor(v) {
+  // Real VIL values top out around 60-75 kg/m^2 for a severe storm --
+  // stops chosen on that real range, not an arbitrary 0-100 scale.
+  if (v < 5) return null;
+  const stops = [
+    [5, [0x40, 0xe0, 0xd0]], [15, [0x00, 0x90, 0x00]], [25, [0xff, 0xff, 0x00]],
+    [35, [0xff, 0x80, 0x00]], [45, [0xff, 0x00, 0x00]], [55, [0xc0, 0x00, 0x00]],
+    [65, [0xff, 0x00, 0xff]],
+  ];
+  for (let i = stops.length - 1; i >= 0; i--) {
+    if (v >= stops[i][0]) return stops[i][1];
+  }
+  return stops[0][1];
+}
+
+function echoTopsColor(v) {
+  // Real echo tops mostly fall 0-55kft; severe storms can push past 60.
+  if (v < 5) return null;
+  const t = Math.max(0, Math.min(1, v / 60));
+  return t < 0.5
+    ? lerpColor([30, 60, 200], [0, 200, 60], t / 0.5)
+    : lerpColor([0, 200, 60], [220, 0, 0], (t - 0.5) / 0.5);
+}
+
+function precip1hColor(v) {
+  if (v < 0.01) return null; // treat as no measurable accumulation
+  const t = Math.max(0, Math.min(1, v / 3)); // 3in/hr is already a real flash-flood-level rate
+  return t < 0.5
+    ? lerpColor([0, 120, 60], [0, 220, 220], t / 0.5)
+    : lerpColor([0, 220, 220], [200, 0, 200], (t - 0.5) / 0.5);
+}
+
+// Real category table, not guessed -- pulled directly from the decode
+// library's own source (MetPy's DigitalHMCMapper: labels indexed 0-14,
+// raw code // 10 = label index), the most trustworthy source available
+// since it's literally what produces the numbers this function receives.
+// ND/GC/BI/UK/RF are non-precipitation categories (no data, clutter,
+// bugs/birds, unknown, range-folded) -- muted gray rather than a "real
+// weather" color, so they don't visually compete with actual precip.
+const HYDROMETEOR_CLASSES = {
+  0: { label: "No Data", color: null },
+  1: { label: "Biological", color: [90, 90, 70] },
+  2: { label: "Ground Clutter/AP", color: [110, 110, 110] },
+  3: { label: "Ice Crystals", color: [180, 220, 255] },
+  4: { label: "Dry Snow", color: [220, 220, 255] },
+  5: { label: "Wet Snow", color: [140, 120, 220] },
+  6: { label: "Light/Moderate Rain", color: [0, 180, 0] },
+  7: { label: "Heavy Rain", color: [0, 100, 0] },
+  8: { label: "Big Drops (Rain)", color: [200, 220, 0] },
+  9: { label: "Graupel", color: [230, 150, 0] },
+  10: { label: "Hail, possibly with Rain", color: [255, 0, 255] },
+  11: { label: "Large Hail", color: [200, 0, 200] },
+  12: { label: "Giant Hail", color: [140, 0, 140] },
+  13: { label: "Unknown", color: [130, 130, 130] },
+  14: { label: "Range Folded", color: [80, 80, 80] },
+};
+
+function hydrometeorColor(v) {
+  return HYDROMETEOR_CLASSES[Math.round(v)]?.color ?? null;
+}
+
 const COLOR_FNS = {
   reflectivity_dbz: dbzColor,
   velocity_ms: velColor,
   zdr_db: zdrColor,
   cc: ccColor,
   phidp_deg: phidpColor,
+  srv_ms: velColor,
+  vil_kgm2: vilColor,
+  echo_tops_kft: echoTopsColor,
+  precip_in: precip1hColor,
+  hc_code: hydrometeorColor,
 };
 
 // ---------------------------------------------------------------------
@@ -425,10 +506,13 @@ function createPanel(product, site) {
     alertsLayer: L.layerGroup().addTo(map),
     nstLayer: L.layerGroup().addTo(map),
     nmdLayer: L.layerGroup().addTo(map),
+    nhiLayer: L.layerGroup().addTo(map), // Hail Index (NHI)
+    ntvLayer: L.layerGroup().addTo(map), // Tornadic Vortex Signature (NTV)
     gpsMarker: null,
     gpsTrail: L.polyline([], { color: "#38bdf8", weight: 2 }).addTo(map),
     siteMarkersLayer: L.layerGroup().addTo(map),
     mosaicOverlay: null, // current national-mosaic imageOverlay, if shown (see refreshMosaic)
+    compositeOverlay: null, // current per-site Composite Reflectivity imageOverlay, if the "composite" product is selected (see renderPanelComposite)
     marksLayer: L.featureGroup().addTo(map), // user-drawn pins/shapes, see redrawUserMarks()
     lightningLayer: L.layerGroup().addTo(map), // GOES-East + GOES-West GLM flashes, see refreshLightning
     snowplowLayer: L.layerGroup().addTo(map), // live Iowa DOT truck positions, see refreshSnowplows
@@ -634,6 +718,19 @@ function syncTiltSelect(panel, data) {
 }
 
 async function renderPanelRadar(panel) {
+  // Composite Reflectivity (NCR) is a real x/y raster grid from NOAA,
+  // not radial azimuth/range data like every other product here -- it
+  // doesn't fit RadarTileLayer at all, so it gets its own image-overlay
+  // path entirely (same shape as the national mosaic), branching out
+  // before any of the tile-layer logic below.
+  if (panel.product === "composite") {
+    await renderPanelComposite(panel);
+    return;
+  }
+  if (panel.compositeOverlay) {
+    panel.map.removeLayer(panel.compositeOverlay);
+    panel.compositeOverlay = null;
+  }
   // The playback scrubber (scans[]/scanIndex) is fetched for a single
   // site (see refreshScanList) -- a panel showing a *different* site
   // than the default has no scan list of its own to scrub through, so
@@ -693,6 +790,31 @@ async function renderPanelRadar(panel) {
       // fight the user's own pan/zoom on every later scan update.
       const maxRange = data.gate0_m + data.ngates * data.gate_step_m;
       panel.map.fitBounds(metersToLatLonBounds(data.lat, data.lon, maxRange));
+      panel.hasAutoFit = true;
+    }
+  } catch (e) {
+    setStatus(`fetch error: ${e.message}`);
+  }
+}
+
+async function renderPanelComposite(panel) {
+  if (panel.radarTileLayer && panel.map.hasLayer(panel.radarTileLayer)) {
+    panel.map.removeLayer(panel.radarTileLayer);
+  }
+  try {
+    const meta = await fetchJSON(`/api/composite?site=${encodeURIComponent(panel.site)}`);
+    if (panel.compositeOverlay) panel.map.removeLayer(panel.compositeOverlay);
+    // Cache-bust on the server's own render timestamp, not Date.now() --
+    // same reasoning as refreshMosaic(), only actually refetches the
+    // image when there's a genuinely new one.
+    const url = `/api/composite.png?site=${encodeURIComponent(panel.site)}&t=${encodeURIComponent(meta.updated)}`;
+    panel.compositeOverlay = L.imageOverlay(url, meta.bounds, { pane: "radarTilePane", opacity: 0.75 });
+    // Same reasoning as the single-site tile layer -- showing this
+    // site's own composite *and* the national mosaic at once is
+    // redundant clutter over the same area.
+    if (!isMosaicActive()) panel.compositeOverlay.addTo(panel.map);
+    if (!panel.hasAutoFit) {
+      panel.map.fitBounds(meta.bounds);
       panel.hasAutoFit = true;
     }
   } catch (e) {
@@ -907,6 +1029,8 @@ async function refreshLevel3() {
   const jobs = [
     ["toggle-nst", "/api/level3/nst", "nstLayer", "#f472b6"],
     ["toggle-nmd", "/api/level3/nmd", "nmdLayer", "#a855f7"],
+    ["toggle-nhi", "/api/level3/nhi", "nhiLayer", "#22d3ee"],
+    ["toggle-ntv", "/api/level3/ntv", "ntvLayer", "#ff2020"],
   ];
   // NST and NMD don't depend on each other -- fire both requests at
   // once instead of awaiting one fully before starting the next.
@@ -1021,7 +1145,7 @@ document.getElementById("play").addEventListener("click", (e) => {
   }
 });
 
-for (const id of ["toggle-cameras", "toggle-alerts", "toggle-nst", "toggle-nmd", "toggle-gps"]) {
+for (const id of ["toggle-cameras", "toggle-alerts", "toggle-nst", "toggle-nmd", "toggle-nhi", "toggle-ntv", "toggle-gps"]) {
   document.getElementById(id).addEventListener("change", () => {
     refreshCameras();
     refreshAlerts();
@@ -1206,10 +1330,16 @@ function isMosaicActive() {
 // data immediately instead of stale tiles from before it was hidden.
 function setRadarLayersVisible(show) {
   for (const p of panels) {
-    if (!p.radarTileLayer) continue;
-    const isShown = p.map.hasLayer(p.radarTileLayer);
-    if (show && !isShown) p.radarTileLayer.addTo(p.map);
-    else if (!show && isShown) p.map.removeLayer(p.radarTileLayer);
+    if (p.radarTileLayer) {
+      const isShown = p.map.hasLayer(p.radarTileLayer);
+      if (show && !isShown) p.radarTileLayer.addTo(p.map);
+      else if (!show && isShown) p.map.removeLayer(p.radarTileLayer);
+    }
+    if (p.compositeOverlay) {
+      const isShown = p.map.hasLayer(p.compositeOverlay);
+      if (show && !isShown) p.compositeOverlay.addTo(p.map);
+      else if (!show && isShown) p.map.removeLayer(p.compositeOverlay);
+    }
   }
 }
 

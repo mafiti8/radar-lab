@@ -21,8 +21,16 @@ import radar_lab
 
 
 def main():
+    # Found 2026-09-25: this had drifted out of sync with radar_lab.py's
+    # own main() (the headless/server entry point) -- lightning and
+    # snowplow tracking were both added after this file was first
+    # written and never backfilled here, so the desktop app would have
+    # silently shipped with those two features always empty. Same three
+    # poll loops as the server entry point now.
     radar_lab.get_cache(radar_lab.SITE)  # start warming the default site immediately
     threading.Thread(target=radar_lab.mosaic_poll_loop, daemon=True).start()
+    threading.Thread(target=radar_lab.lightning_poll_loop, daemon=True).start()
+    threading.Thread(target=radar_lab.snowplow_poll_loop, daemon=True).start()
 
     server = radar_lab.ThreadingHTTPServer(("127.0.0.1", radar_lab.PORT), radar_lab.Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
